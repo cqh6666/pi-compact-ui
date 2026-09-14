@@ -637,6 +637,42 @@ function installCompactionSummaryRendering(): void {
 }
 
 const TOOL_EXECUTION_PATCH_KEY = Symbol.for("pi-compact-ui.tool-execution-patch");
+const TOOL_EXECUTION_INSTALLED_KEY = Symbol.for("pi-compact-ui.tool-execution-installed");
+
+function parseCompressStats(firstLine: string): {
+	beforeStr: string;
+	afterStr: string;
+	reclaimedStr: string;
+	pct: number;
+} | null {
+	const match = firstLine.match(/([\d.]+\s*[KkMm]?)\s*→\s*([\d.]+\s*[KkMm]?)\s*tokens?\s*(?:\(~?([\d.]+\s*[KkMm]?)?\s*reclaimed)?/i);
+	if (!match) return null;
+	const beforeStr = match[1]?.trim() ?? "";
+	const afterStr = match[2]?.trim() ?? "";
+	let reclaimedStr = match[3]?.trim() ?? "";
+
+	const parseTokens = (s: string) => {
+		const m = s.match(/([\d.]+)\s*([KkMm]?)/i);
+		if (!m) return 0;
+		const n = parseFloat(m[1] ?? "0");
+		const unit = (m[2] ?? "").toUpperCase();
+		if (unit === "K") return n * 1000;
+		if (unit === "M") return n * 1000000;
+		return n;
+	};
+
+	const beforeNum = parseTokens(beforeStr);
+	const afterNum = parseTokens(afterStr);
+	let pct = 0;
+	if (beforeNum > 0 && beforeNum >= afterNum) {
+		pct = Math.round(((beforeNum - afterNum) / beforeNum) * 100);
+		if (!reclaimedStr && beforeNum > afterNum) {
+			const diff = beforeNum - afterNum;
+			reclaimedStr = diff >= 1000 ? `${(diff / 1000).toFixed(1).replace(/\.0$/, "")}K` : `${diff}`;
+		}
+	}
+	return { beforeStr, afterStr, reclaimedStr, pct };
+}
 
 function renderCompressRows(tool: any, width: number): string[] {
 	const theme = currentTheme;
@@ -650,12 +686,12 @@ function renderCompressRows(tool: any, width: number): string[] {
 
 	if (isPending) {
 		scheduleAnimation();
-		const line = `${fg("accent", frame)} ${fg("accent", bold("▣ ACP"))} ${fg("dim", "compressing context...")} ${fg("muted", `(${toolElapsed(tool)}s)`)}`;
+		const line = `${fg("accent", frame)} ${fg("accent", bold("▣ ACP Context"))} ${fg("dim", "compressing context...")} ${fg("dim", "·")} ${fg("muted", `${toolElapsed(tool)}s`)}`;
 		return [padding + truncateToWidth(line, contentWidth, "…")];
 	}
 
 	if (tool.result?.isError) {
-		const line = `${fg("error", "✗")} ${fg("error", bold("▣ ACP"))} ${fg("error", "compression failed")} ${fg("muted", `(${toolElapsed(tool)}s)`)}`;
+		const line = `${fg("error", "✗")} ${fg("error", bold("▣ ACP Context"))} ${fg("error", "compression failed")} ${fg("dim", "·")} ${fg("muted", `${toolElapsed(tool)}s`)}`;
 		return [padding + truncateToWidth(line, contentWidth, "…")];
 	}
 
@@ -666,20 +702,36 @@ function renderCompressRows(tool: any, width: number): string[] {
 		.trim();
 
 	const firstLine = output.split("\n")[0]?.trim() ?? "";
-	let statsSummary = "";
-	const tokenMatch = firstLine.match(/(\d+(?:\.\d+)?[KkMmbB]?\s*→\s*\d+(?:\.\d+)?[KkMmbB]?\s*tokens?\s*(?:\(~[^)]+\))?)/i);
-	if (tokenMatch) {
-		statsSummary = tokenMatch[1].trim();
-	} else {
-		const pipeIdx = firstLine.indexOf("|");
-		if (pipeIdx >= 0) {
-			statsSummary = firstLine.slice(pipeIdx + 1).split(",")[0].trim();
-		} else {
-			statsSummary = firstLine.replace(/^▣\s*ACP\s*\|?\s*/i, "").trim() || "context compressed";
+	const stats = parseCompressStats(firstLine);
+
+	let statsFormatted = "";
+	if (stats) {
+		const transition = `${fg("dim", stats.beforeStr)} ${fg("dim", "→")} ${fg("syntaxKeyword", bold(stats.afterStr))}`;
+		let savings = "";
+		if (stats.reclaimedStr && stats.reclaimedStr !== "0") {
+			const pctText = stats.pct > 0 ? ` / ${stats.pct}% saved` : "";
+			savings = `  ${fg("success", bold(`(-${stats.reclaimedStr}${pctText})`))}`;
+		} else if (stats.pct > 0) {
+			savings = `  ${fg("success", bold(`(${stats.pct}% saved)`))}`;
 		}
+		statsFormatted = `${transition}${savings}`;
+	} else {
+		let statsSummary = "";
+		const tokenMatch = firstLine.match(/(\d+(?:\.\d+)?[KkMmbB]?\s*→\s*\d+(?:\.\d+)?[KkMmbB]?\s*tokens?\s*(?:\(~[^)]+\))?)/i);
+		if (tokenMatch) {
+			statsSummary = tokenMatch[1].trim();
+		} else {
+			const pipeIdx = firstLine.indexOf("|");
+			if (pipeIdx >= 0) {
+				statsSummary = firstLine.slice(pipeIdx + 1).split(",")[0].trim();
+			} else {
+				statsSummary = firstLine.replace(/^▣\s*ACP\s*\|?\s*/i, "").trim() || "context compressed";
+			}
+		}
+		statsFormatted = fg("toolTitle", statsSummary);
 	}
 
-	const singleLine = `${fg("success", "✓")} ${fg("accent", bold("▣ ACP"))} ${fg("dim", "·")} ${fg("toolTitle", statsSummary)} ${fg("muted", `(${toolElapsed(tool)}s)`)}`;
+	const singleLine = `${fg("success", "✓")} ${fg("accent", bold("▣ ACP Context"))}  ${statsFormatted}  ${fg("dim", "·")} ${fg("muted", `${toolElapsed(tool)}s`)}`;
 
 	if (!tool.expanded) {
 		return [padding + truncateToWidth(singleLine, contentWidth, "…")];
@@ -730,15 +782,17 @@ function renderCompressRows(tool: any, width: number): string[] {
 
 function installToolExecutionCustomRendering(): void {
 	const prototype = ToolExecutionComponent.prototype as any;
-	if (prototype[TOOL_EXECUTION_PATCH_KEY]) return;
+	prototype[TOOL_EXECUTION_PATCH_KEY] = renderCompressRows;
+	if (prototype[TOOL_EXECUTION_INSTALLED_KEY]) return;
 	const originalRender = prototype.render;
 	prototype.render = function (this: any, width: number): string[] {
 		if (this.toolName === "compress") {
-			return renderCompressRows(this, width);
+			const handler = prototype[TOOL_EXECUTION_PATCH_KEY] || renderCompressRows;
+			return handler(this, width);
 		}
 		return originalRender.call(this, width);
 	};
-	prototype[TOOL_EXECUTION_PATCH_KEY] = true;
+	prototype[TOOL_EXECUTION_INSTALLED_KEY] = true;
 }
 
 /**
