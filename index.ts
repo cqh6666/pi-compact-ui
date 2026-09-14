@@ -18,7 +18,7 @@
  *   { "collapsedMaxLines": 3, "expandedToolLines": 5, "expandedThinkingLines": 10 }
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import {
 	AssistantMessageComponent,
 	CompactionSummaryMessageComponent,
@@ -187,6 +187,9 @@ const ASSISTANT_THINKING_PATCH_KEY = Symbol.for("compact-ui.assistant-thinking-p
 
 let currentTheme: any = null;
 let thinkingActive = false;
+let thinkingStartedAt: number | undefined;
+let thinkingElapsedMs = 0;
+let thinkingTimingKnown = false;
 let thinkingText = "";
 // Most providers report reasoning usage only when the response finishes. While
 // streaming, fall back to pi's own chars/4 token heuristic and mark it with ≈.
@@ -221,6 +224,29 @@ function shortenPath(path: string): string {
 function oneLine(value: unknown, max = 60): string {
 	const text = String(value ?? "").replace(/\s+/g, " ").trim();
 	return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function resetThinking(): void {
+	thinkingActive = false;
+	thinkingText = "";
+	thinkingElapsedMs = 0;
+	thinkingTimingKnown = false;
+	thinkingStartedAt = undefined;
+	thinkingTokenCount = 0;
+	thinkingTokenCountExact = false;
+	thinkingBlocks.clear();
+	assistantThinkingStarted = false;
+}
+
+function stopThinking(): void {
+	if (thinkingStartedAt !== undefined) thinkingElapsedMs += Date.now() - thinkingStartedAt;
+	thinkingStartedAt = undefined;
+	thinkingActive = false;
+}
+
+function thinkingDuration(): number | undefined {
+	if (!thinkingTimingKnown) return undefined;
+	return thinkingElapsedMs + (thinkingStartedAt === undefined ? 0 : Date.now() - thinkingStartedAt);
 }
 
 function estimateTextTokens(text: string): number {
@@ -261,7 +287,7 @@ function toolSummary(name: string, args: any): { name: string; content: string }
 		case "ls":
 			return { name: "ls", content: shortenPath(args?.path || ".") };
 		case "web_search":
-			return { name: "web_search", content: oneLine(args?.query || "…") };
+			return { name: "web_search", content: oneLine(args?.query || (Array.isArray(args?.queries) ? args.queries.join("; ") : "") || "…") };
 		case "subagent":
 			return { name: "subagent", content: oneLine(args?.agent || args?.task || "…") };
 		default: {
@@ -273,20 +299,202 @@ function toolSummary(name: string, args: any): { name: string; content: string }
 
 type ToolStatus = "pending" | "success" | "error";
 function toolStatus(tool: any): ToolStatus {
-	if (tool?.result?.isError) return "error";
 	if (tool?.isPartial === true || (tool?.executionStarted && !tool?.result)) return "pending";
+	if (tool?.result?.isError) return "error";
 	return tool?.result ? "success" : "pending";
 }
 
+type ToolResultSummary = {
+	isError?: boolean;
+	details?: unknown;
+	content?: { type: string; text?: string }[];
+};
+
+export function getToolExecutionPhase(details: unknown): string | undefined {
+	if (!details || typeof details !== "object") return undefined;
+	const data = details as Record<string, unknown>;
+	if (typeof data.phase !== "string" || !data.phase.trim()) return undefined;
+	const phase = oneLine(stripTerminalSequences(data.phase));
+	const query = typeof data.currentQuery === "string" ? oneLine(stripTerminalSequences(data.currentQuery)) : "";
+	const progress = typeof data.progress === "string" ? oneLine(stripTerminalSequences(data.progress)) : "";
+	switch (phase) {
+		case "searching": return query ? `searching: "${query}"` : "searching";
+		case "generating": return "generating summary";
+		case "waiting_approval": return "waiting approval";
+		case "downloading": return progress ? `downloading: ${progress}` : "downloading";
+		default: return phase.replace(/[-_]+/g, " ").toLowerCase();
+	}
+}
+
+export function extractFailureReason(result: ToolResultSummary | undefined): string | undefined {
+	if (!result?.isError) return undefined;
+	const details = result.details && typeof result.details === "object" ? result.details as Record<string, unknown> : {};
+	const error = details.error;
+	const message = typeof error === "string" ? error : error && typeof error === "object" && "message" in error ? error.message : undefined;
+	if (typeof message === "string" && message.trim()) return oneLine(stripTerminalSequences(message), 500);
+	const lines = (result.content ?? [])
+		.filter((item) => item.type === "text" && typeof item.text === "string")
+		.flatMap((item) => stripTerminalSequences(item.text!).split(/\r?\n/))
+		.map((line) => line.trim())
+		.filter(Boolean);
+	// Select a cause only after the result has explicitly reported failure.
+	const cause = lines.find((line) => !/^(?:>|failed with \d+ errors?$)/i.test(line) && (/(?:\berror(?:\s+TS\d+)?\s*:|\b[A-Za-z]*Error\s*:|permission denied|no such file|not found|timed? out|\bfailed at\b)/i.test(line) || /\bE[A-Z]{2,}\b/.test(line)));
+	if (cause) return cause;
+	return lines.find((line) => !/^(?:>|at\s|command failed:?$|failed with \d+ errors?$)/i.test(line)) ?? lines[0];
+}
+
+export function renderEditDiff(
+	diff: unknown,
+	width: number,
+	maxLines: number,
+	theme: Pick<Theme, "fg"> | null,
+): { lines: string[]; truncated: boolean } | undefined {
+	if (typeof diff !== "string" || !diff.trim()) return undefined;
+	const rows = diff.split(/\r?\n/);
+	if (!rows.some((line) => /^[+-](?![+-]{2})/.test(line))) return undefined;
+	const limit = Math.max(1, maxLines);
+	const lines = rows.slice(0, limit).map((row) => {
+		const color: ThemeColor = row.startsWith("+") && !row.startsWith("+++") ? "toolDiffAdded"
+			: row.startsWith("-") && !row.startsWith("---") ? "toolDiffRemoved" : "toolDiffContext";
+		const text = stripTerminalSequences(row).replace(/\t/g, "   ");
+		return truncateToWidth(theme?.fg?.(color, text) ?? text, Math.max(1, width), "…");
+	});
+	return { lines, truncated: rows.length > limit };
+}
+
+export type AggregatedItem<T> =
+	| { type: "tool"; tool: T }
+	| { type: "aggregate"; name: string; tools: T[]; count: number; distinctCount?: number; distinctUnit?: string };
+
+export function aggregateConsecutiveTools<T>(
+	tools: readonly T[],
+	getToolName: (tool: T) => string,
+	getStatus: (tool: T) => ToolStatus,
+	getArgs: (tool: T) => unknown,
+): AggregatedItem<T>[] {
+	const items: AggregatedItem<T>[] = [];
+	for (let start = 0; start < tools.length;) {
+		const tool = tools[start]!;
+		const name = getToolName(tool);
+		let end = start + 1;
+		if (getStatus(tool) === "success" && !config.standaloneTools?.includes(name)) {
+			while (end < tools.length && getToolName(tools[end]!) === name && getStatus(tools[end]!) === "success") end++;
+		}
+		if (end === start + 1) {
+			items.push({ type: "tool", tool });
+		} else {
+			const run = tools.slice(start, end);
+			const paths = run.map((item) => {
+				const args = getArgs(item);
+				return args && typeof args === "object" && "path" in args && typeof args.path === "string" && args.path ? args.path : undefined;
+			});
+			const files = ["read", "write", "edit"].includes(name) && paths.every((path) => path !== undefined);
+			const searches = ["grep", "find", "zvec_grep_search", "web_search"].includes(name);
+			items.push({
+				type: "aggregate", name, tools: run, count: run.length,
+				distinctCount: files ? new Set(paths).size : searches ? run.length : undefined,
+				distinctUnit: files ? "files" : searches ? "searches" : undefined,
+			});
+		}
+		start = end;
+	}
+	return items;
+}
+
+export function selectCollapsedItems<T>(items: AggregatedItem<T>[], getStatus: (tool: T) => ToolStatus, maxLines: number, hasThinking: boolean): { items: AggregatedItem<T>[]; showThinking: boolean } {
+	const capacity = Math.max(1, maxLines - 1);
+	const selected: AggregatedItem<T>[] = [];
+	const failed = items.find((item) => item.type === "tool" && getStatus(item.tool) === "error");
+	const pending = items.findLast((item) => item.type === "tool" && getStatus(item.tool) === "pending");
+	if (failed) selected.push(failed);
+	if (pending && selected.length < capacity) selected.push(pending);
+	const showThinking = hasThinking && capacity > selected.length && (selected.length > 0 || capacity > 1 || items.length === 0);
+	for (const item of items.slice().reverse()) {
+		if (selected.length >= capacity - Number(showThinking)) break;
+		if (!selected.includes(item)) selected.push(item);
+	}
+	return { items: selected, showThinking };
+}
+
+function aggregateLabel<T>(item: Extract<AggregatedItem<T>, { type: "aggregate" }>): string {
+	const count = item.distinctCount ?? item.count;
+	const unit = item.distinctUnit ?? "calls";
+	return `${count} ${count === 1 ? unit === "searches" ? "search" : unit.slice(0, -1) : unit}`;
+}
+
+function resultSummary(name: string, result?: ToolResultSummary, partial = false): string {
+	if (!result || partial) return "";
+	const data = result.details && typeof result.details === "object" ? result.details as Record<string, unknown> : {};
+	const texts = result.content?.filter((item) => item.type === "text" && typeof item.text === "string");
+	const text = texts?.map((item) => item.text).join("\n");
+	const truncation = data.truncation as { outputLines?: unknown; truncated?: boolean } | undefined;
+	const count = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+	if (name === "bash") {
+		if (typeof data.exitCode === "number" && Number.isSafeInteger(data.exitCode)) return `exit ${data.exitCode}`;
+		const status = result.isError ? text?.match(/(?:^|\n\n)Command exited with code (-?\d+)(?![\s\S])/) : undefined;
+		const code = status ? Number(status[1]) : undefined;
+		return code !== undefined && Number.isSafeInteger(code) && code !== 0 ? `exit ${code}` : "";
+	}
+	if (result.isError) return "";
+	if (name === "read") {
+		if (result.content?.some((item) => item.type === "image") || /^Read image file \[image\/[^\]\n]+\](?:\n|$)/.test(text ?? "")) return "";
+		if (count(truncation?.outputLines)) return `${truncation.outputLines} lines shown`;
+		if (count(data.lineCount)) return `${data.lineCount} lines`;
+		if (!texts?.length || text === undefined) return "";
+		if (/^\[Line \d+ is [^\n]+, exceeds [^\n]+ limit\. Use bash: [^\n]+\](?![\s\S])/.test(text)) return "";
+		const displayed = text.replace(/\n\n\[\d+ more lines in file\. Use offset=\d+ to continue\.\](?![\s\S])/, "");
+		return `${displayed.split("\n").length} lines shown`;
+	}
+	if (name === "edit" && typeof data.diff === "string") {
+		const rows = data.diff.split("\n");
+		const added = rows.filter((row) => /^\+\s*\d+ /.test(row)).length;
+		const removed = rows.filter((row) => /^-\s*\d+ /.test(row)).length;
+		if (added || removed) return `+${added}/-${removed}`;
+	}
+	if (name === "grep") {
+		if (count(data.matchLimitReached)) return `≥${data.matchLimitReached} matches`;
+		if (count(data.matchCount)) return `${data.matchCount} matches`;
+		if (text === "No matches found") return "0 matches";
+		const matches = new Set<string>();
+		for (const row of text?.split("\n") ?? []) {
+			const match = row.match(/^(.+?)(?::([1-9]\d*): |-[1-9]\d*- )/);
+			if (match?.[2]) matches.add(`${match[1]}:${match[2]}`);
+		}
+		if (matches.size) return `${matches.size} matches${truncation?.truncated ? " shown" : ""}`;
+	}
+	if (name === "web_search") {
+		if (count(data.totalResults)) return `${data.totalResults} results`;
+		if (count(data.resultCount)) return `${data.resultCount} results`;
+		if (Array.isArray(data.results)) return `${data.results.length} results`;
+	}
+	return "";
+}
+
+type GroupTool = { status: ToolStatus; startedAt?: number; endedAt?: number };
+
+function groupHeader(tools: GroupTool[], thinking: boolean, frame: string, fg: (color: string, text: string) => string): string {
+	const pending = tools.some((tool) => tool.status === "pending");
+	const failed = tools.filter((tool) => tool.status === "error").length;
+	const working = pending || thinking;
+	const color = failed ? "error" : pending ? "accent" : thinking ? "thinkingText" : "success";
+	const label = pending ? "tool calling..." : thinking ? "thinking..." : "tools done";
+	let detail = tools.length ? ` · ${tools.length} ${tools.length === 1 ? "tool" : "tools"}` : "";
+	if (failed) detail += ` · ${failed} failed`;
+	if (tools.length && !working) {
+		const known = tools.every((tool) => tool.startedAt !== undefined && tool.endedAt !== undefined && tool.endedAt >= tool.startedAt);
+		const elapsed = known ? ((Math.max(...tools.map((tool) => tool.endedAt!)) - Math.min(...tools.map((tool) => tool.startedAt!))) / 1000).toFixed(1) : "—";
+		detail += ` · ${elapsed}s`;
+	}
+	return fg(color, `${working ? frame : failed ? "✗" : "✓"} ${label}${detail}`);
+}
+
 function toolElapsed(tool: any): string {
-	const start = toolStarts.get(tool?.toolCallId) ?? Date.now();
-	if (!tool?.result) {
-		return ((Date.now() - start) / 1000).toFixed(1);
-	}
-	if (tool._groupEndAt === undefined) {
-		tool._groupEndAt = toolEnds.get(tool?.toolCallId) ?? Date.now();
-	}
-	return ((tool._groupEndAt - start) / 1000).toFixed(1);
+	const start = toolStarts.get(tool?.toolCallId);
+	if (start === undefined) return "—";
+	const pending = tool?.isPartial === true || !tool?.result;
+	const end = toolEnds.get(tool?.toolCallId) ?? (pending ? Date.now() : undefined);
+	if (end === undefined) return "—";
+	return ((end - start) / 1000).toFixed(1);
 }
 
 function toolResultText(tool: any): string {
@@ -401,6 +609,7 @@ export type CompactExternalTool = {
 	args: any;
 	status: ToolStatus;
 	resultText: string;
+	resultDetails?: unknown;
 	startedAt: number;
 	endedAt?: number;
 };
@@ -412,6 +621,8 @@ export type CompactExternalGroup = {
 	sealed: boolean;
 	thinkingTokens?: number;
 	thinkingTokensExact?: boolean;
+	thinkingStartedAt?: number;
+	thinkingEndedAt?: number;
 };
 
 /**
@@ -443,20 +654,40 @@ export class CompactExternalGroupComponent implements Component {
 	}
 
 	private elapsed(tool: CompactExternalTool): string {
-		const end = tool.endedAt ?? Date.now();
+		const end = tool.endedAt ?? (tool.status === "pending" ? Date.now() : undefined);
+		if (end === undefined) return "—s";
 		return `${Math.max(0, (end - tool.startedAt) / 1000).toFixed(1)}s`;
 	}
 
-	private toolRow(rail: string, tool: CompactExternalTool, frame: string): string {
+	private toolRow(rail: string, tool: CompactExternalTool, frame: string, previewFailure = false): string {
 		const fg = (color: string, text: string) => this.theme?.fg?.(color, text) ?? text;
 		const bold = this.theme?.bold ? (text: string) => this.theme.bold(text) : (text: string) => text;
 		const summary = toolSummary(tool.name, tool.args);
-		return `${fg("dim", rail)}${fg(this.color(tool), this.icon(tool, frame))} ${fg("toolTitle", bold(summary.name))} ${fg("dim", summary.content)} ${fg("muted", `(${this.elapsed(tool)})`)}`;
+		const phase = tool.status === "pending" ? getToolExecutionPhase(tool.resultDetails) : undefined;
+		if (phase) {
+			summary.content = `${phase} · ${summary.content}`;
+		} else {
+			const stats = resultSummary(tool.name, {
+				details: tool.resultDetails,
+				isError: tool.status === "error",
+				content: [{ type: "text", text: tool.resultText }],
+			}, tool.status === "pending");
+			if (stats) summary.content += ` · ${stats}`;
+		}
+		if (previewFailure && tool.status === "error") {
+			const result = { isError: true, details: tool.resultDetails, content: [{ type: "text", text: tool.resultText }] };
+			const reason = extractFailureReason(result);
+			const stats = resultSummary(tool.name, result);
+			if (reason) summary.content = `${reason}${stats ? ` · ${stats}` : ""}`;
+		}
+		return `${fg("dim", rail)}${fg(this.color(tool), this.icon(tool, frame))} ${fg("toolTitle", bold(summary.name))} ${fg(tool.status === "error" ? "error" : "dim", oneLine(summary.content, 500))} ${fg("muted", `(${this.elapsed(tool)})`)}`;
 	}
 
 	private tokenLabel(): string {
 		const tokens = this.state.thinkingTokens ?? estimateTextTokens(this.state.thinking);
-		return `${this.state.thinkingTokensExact ? "" : "≈"}${formatTokenK(tokens)} tok`;
+		const end = this.state.thinkingEndedAt ?? (this.state.thinkingActive && !this.state.sealed ? Date.now() : undefined);
+		const duration = this.state.thinkingStartedAt !== undefined && end !== undefined ? `${Math.max(0, (end - this.state.thinkingStartedAt) / 1000).toFixed(1)}s` : "—s";
+		return `${this.state.thinkingTokensExact ? "" : "≈"}${formatTokenK(tokens)} tok · ${duration}`;
 	}
 
 	private markdownLines(source: string, width: number, maxLines: number, color: string, italic = false): string[] {
@@ -481,56 +712,57 @@ export class CompactExternalGroupComponent implements Component {
 
 	private renderCollapsed(width: number, frame: string): string[] {
 		const fg = (color: string, text: string) => this.theme?.fg?.(color, text) ?? text;
-		const pending = this.state.tools.some((tool) => tool.status === "pending");
-		const openThinking = this.state.thinkingActive && !this.state.sealed;
-		const openEmpty = !this.state.sealed && this.state.tools.length === 0;
-		const working = pending || openThinking || openEmpty;
-		const label = pending ? "tool calling..." : openThinking || openEmpty ? "thinking..." : "tools done";
-		const color = pending ? "accent" : openThinking || openEmpty ? "thinkingText" : "success";
-		const lines = [`${fg(color, working ? frame : "✓")} ${fg(color, label)}`];
-		const maxLines = Math.max(2, config.collapsedMaxLines);
+		const bold = (text: string) => this.theme?.bold?.(text) ?? text;
+		const lines = [groupHeader(this.state.tools, !this.state.sealed && (this.state.thinkingActive || this.state.tools.length === 0), frame, fg)];
 		const thinking = this.state.thinking.trim().replace(/[*_#`>]+/g, "");
-		const reserveThinking = thinking.length > 0;
-		let shown = 0;
-		for (let index = this.state.tools.length - 1; index >= 0; index--) {
-			if (lines.length >= maxLines - (reserveThinking ? 1 : 0)) break;
-			const isOldest = index === 0 && !reserveThinking;
-			lines.push(this.toolRow(isOldest ? "└  " : "│  ", this.state.tools[index]!, frame));
-			shown++;
+		const aggregated = aggregateConsecutiveTools(this.state.tools, (tool) => tool.name, (tool) => tool.status, (tool) => tool.args);
+		const selection = selectCollapsedItems(aggregated, (tool) => tool.status, config.collapsedMaxLines, thinking.length > 0);
+		for (const [index, item] of selection.items.entries()) {
+			const rail = index === selection.items.length - 1 && !selection.showThinking ? "└  " : "│  ";
+			lines.push(item.type === "aggregate"
+				? `${fg("dim", rail)}${fg("success", "✓")} ${fg("toolTitle", bold(item.name))} ${fg("dim", `· ${aggregateLabel(item)}`)}`
+				: this.toolRow(rail, item.tool, frame, true));
 		}
-		if (shown < this.state.tools.length && lines.length < maxLines) {
-			lines.push(`${fg("dim", "│  ")} ${fg("muted", `… +${this.state.tools.length - shown} more`)}`);
-		}
-		if (reserveThinking && lines.length < maxLines) {
+		if (selection.showThinking) {
 			const previewWidth = Math.max(1, Math.min(50, width - GROUP_PADDING_X - 18 - this.tokenLabel().length));
-			lines.push(
-				`${fg("dim", "└  ")}${fg("muted", "·")} ${fg("thinkingText", `thinking: ${oneLine(thinking, previewWidth)}`)} ${fg("muted", `· ${this.tokenLabel()}`)}`,
-			);
+			lines.push(`${fg("dim", "└  ")}${fg("muted", "·")} ${fg("thinkingText", `thinking: ${oneLine(thinking, previewWidth)}`)} ${fg("muted", `· ${this.tokenLabel()}`)}`);
 		}
 		return lines;
 	}
 
 	private renderExpanded(width: number, frame: string): string[] {
 		const fg = (color: string, text: string) => this.theme?.fg?.(color, text) ?? text;
-		const pending = this.state.tools.some((tool) => tool.status === "pending");
-		const openThinking = this.state.thinkingActive && !this.state.sealed;
-		const openEmpty = !this.state.sealed && this.state.tools.length === 0;
-		const working = pending || openThinking || openEmpty;
-		const label = pending ? "tool calling..." : openThinking || openEmpty ? "thinking..." : "tools done";
-		const color = pending ? "accent" : openThinking || openEmpty ? "thinkingText" : "success";
-		const lines = [`${fg(color, working ? frame : "✓")} ${fg(color, label)}`];
+		const lines = [groupHeader(this.state.tools, !this.state.sealed && (this.state.thinkingActive || this.state.tools.length === 0), frame, fg)];
 		for (let index = 0; index < this.state.tools.length; index++) {
 			const tool = this.state.tools[index]!;
 			const last = index === this.state.tools.length - 1;
 			const sub = last ? "    " : "│   ";
 			lines.push(this.toolRow(last ? "└─ " : "├─ ", tool, frame));
-			for (const row of this.markdownLines(
-				tool.resultText,
-				Math.max(1, width - GROUP_PADDING_X - sub.length),
-				config.expandedToolLines,
-				"toolOutput",
-			)) {
-				lines.push(`${fg("dim", sub)}${row}`);
+
+			const subWidth = Math.max(1, width - GROUP_PADDING_X - sub.length);
+			let diffRendered = false;
+			if (tool.name === "edit" && tool.resultDetails && tool.status !== "error") {
+				const editDiff = renderEditDiff((tool.resultDetails as Record<string, unknown>).diff, subWidth, config.expandedToolLines, this.theme);
+				if (editDiff) {
+					for (const row of editDiff.lines) {
+						lines.push(`${fg("dim", sub)}${row}`);
+					}
+					if (editDiff.truncated) {
+						lines.push(`${fg("dim", sub)}${fg("muted", "…")}`);
+					}
+					diffRendered = true;
+				}
+			}
+
+			if (!diffRendered) {
+				for (const row of this.markdownLines(
+					tool.resultText,
+					subWidth,
+					config.expandedToolLines,
+					"toolOutput",
+				)) {
+					lines.push(`${fg("dim", sub)}${row}`);
+				}
 			}
 		}
 		if (this.state.thinking.trim()) {
@@ -859,10 +1091,21 @@ class ToolGroupComponent extends Container {
 	/** Token snapshot paired with thinkingFrozen. */
 	thinkingTokensFrozen = 0;
 	thinkingTokensFrozenExact = false;
+	thinkingDurationFrozen: number | undefined;
 	private markdownPreviewCache = new Map<string, MarkdownPreview>();
 
 	constructor() {
 		super();
+	}
+
+	seal(): void {
+		stopThinking();
+		this.sealed = true;
+		this.thinkingFrozen = thinkingText;
+		this.thinkingTokensFrozen = thinkingTokenCount;
+		this.thinkingTokensFrozenExact = thinkingTokenCountExact;
+		this.thinkingDurationFrozen = thinkingDuration();
+		this.invalidate();
 	}
 
 	setExpanded(expanded: boolean): void {
@@ -950,13 +1193,25 @@ class ToolGroupComponent extends Container {
 		return status === "pending" ? "accent" : status === "error" ? "error" : "success";
 	}
 	// Tool name in bold accent, tool payload in dim.
-	private toolRow(rail: string, tool: any, frame: string): string {
+	private toolRow(rail: string, tool: any, frame: string, previewFailure = false): string {
 		const theme = currentTheme;
 		const fg = (color: string, text: string) => theme?.fg?.(color, text) ?? text;
 		const bold = theme?.bold ? theme.bold : (t: string) => t;
 		const st = toolStatus(tool);
 		const s = toolSummary(tool.toolName, tool.args);
-		return `${fg("dim", rail)}${fg(this.colorFor(st), this.iconFor(tool, frame))} ${fg("toolTitle", bold(s.name))} ${fg("dim", s.content)} ${fg("muted", `(${toolElapsed(tool)}s)`)}`;
+		const phase = st === "pending" ? getToolExecutionPhase(tool?.result?.details) : undefined;
+		if (phase) {
+			s.content = `${phase} · ${s.content}`;
+		} else {
+			const stats = resultSummary(tool.toolName, tool.result, tool.isPartial);
+			if (stats) s.content += ` · ${stats}`;
+		}
+		if (previewFailure && st === "error") {
+			const reason = extractFailureReason(tool.result);
+			const stats = resultSummary(tool.toolName, tool.result);
+			if (reason) s.content = `${reason}${stats ? ` · ${stats}` : ""}`;
+		}
+		return `${fg("dim", rail)}${fg(this.colorFor(st), this.iconFor(tool, frame))} ${fg("toolTitle", bold(s.name))} ${fg(st === "error" ? "error" : "dim", oneLine(s.content, 500))} ${fg("muted", `(${toolElapsed(tool)}s)`)}`;
 	}
 	// Live state only applies to the not-yet-sealed (active) block.
 	private liveThinking(): string {
@@ -965,62 +1220,47 @@ class ToolGroupComponent extends Container {
 	private liveThinkingTokenLabel(): string {
 		const tokens = this.sealed || this !== lastActiveGroup ? this.thinkingTokensFrozen : thinkingTokenCount;
 		const exact = this.sealed || this !== lastActiveGroup ? this.thinkingTokensFrozenExact : thinkingTokenCountExact;
-		return `${exact ? "" : "≈"}${formatTokenK(tokens)} tok`;
+		const duration = this.sealed || this !== lastActiveGroup ? this.thinkingDurationFrozen : thinkingDuration();
+		return `${exact ? "" : "≈"}${formatTokenK(tokens)} tok · ${duration === undefined ? "—" : (duration / 1000).toFixed(1)}s`;
 	}
 	private liveThinkingActive(): boolean {
-		return !this.sealed && thinkingActive;
+		return this === lastActiveGroup && !this.sealed && thinkingActive;
 	}
 	private livePending(): boolean {
 		return !this.sealed && this.children.some((t) => toolStatus(t) === "pending");
 	}
 
+	private header(frame: string, fg: (color: string, text: string) => string): string {
+		const tools = this.children.map((child) => {
+			const tool = child as Component & { toolCallId?: string };
+			return { status: toolStatus(tool), startedAt: toolStarts.get(tool.toolCallId ?? ""), endedAt: toolEnds.get(tool.toolCallId ?? "") };
+		});
+		return groupHeader(tools, this.liveThinkingActive() || (!this.sealed && tools.length === 0), frame, fg);
+	}
+
 	// Folded: header + up to collapsedMaxLines total, ellipsis when exceeding.
 	private renderCollapsed(width: number): string[] {
-		const theme = currentTheme;
-		const fg = (color: string, text: string) => theme?.fg?.(color, text) ?? text;
+		const fg = (color: string, text: string) => currentTheme?.fg?.(color, text) ?? text;
+		const bold = (text: string) => currentTheme?.bold?.(text) ?? text;
 		const frame = SPINNER[Math.floor((Date.now() - spinnerStart) / SPINNER_MS) % SPINNER.length]!;
-		const lines: string[] = [];
-
-		const hasPendingTool = this.hasPending();
-		const isThinking = this.liveThinkingActive();
-		// An open block with no tools yet is still "thinking" (waiting for tools or
-		// a text seal); only sealed / tool-bearing blocks show a completion mark.
-		const openNoTools = !this.sealed && this.children.length === 0;
-		const working = hasPendingTool || isThinking || openNoTools;
-		const state = hasPendingTool ? "tool calling..." : isThinking || openNoTools ? "thinking..." : "tools done";
-		const stateColor = hasPendingTool ? "accent" : isThinking || openNoTools ? "thinkingText" : "success";
-		// Left icon: spinner while working, completion mark once the group is done.
-		const leftIcon = working ? frame : "✓";
-		lines.push(`${fg(stateColor, leftIcon)} ${fg(stateColor, state)}`);
-
-		const maxLines = Math.max(2, config.collapsedMaxLines);
-		const total = this.children.length;
-		const tText = this.liveThinking().trim().replace(/[*_#`>]+/g, "");
-
-		// Reserve the last line for the thinking footer when there is one.
-		// Folded tools are listed newest-first: the most recent call sits on top.
-		const keepThinking = tText.length > 0;
-		let shown = 0;
-		for (let index = 0; index < total; index++) {
-			const room = maxLines - (keepThinking ? 1 : 0);
-			if (lines.length >= room) break;
-			const tool = this.children[total - 1 - index];
-			const isLastTool = index === total - 1 && !keepThinking;
-			const rail = isLastTool ? "└  " : "│  ";
-			lines.push(this.toolRow(rail, tool, frame));
-			shown++;
+		const lines = [this.header(frame, fg)];
+		const thinking = this.liveThinking().trim().replace(/[*_#`>]+/g, "");
+		const aggregated = aggregateConsecutiveTools(this.children,
+			(tool) => (tool as Component & { toolName: string }).toolName,
+			toolStatus,
+			(tool) => (tool as Component & { args?: unknown }).args);
+		const selection = selectCollapsedItems(aggregated, toolStatus, config.collapsedMaxLines, thinking.length > 0);
+		for (const [index, item] of selection.items.entries()) {
+			const rail = index === selection.items.length - 1 && !selection.showThinking ? "└  " : "│  ";
+			lines.push(item.type === "aggregate"
+				? `${fg("dim", rail)}${fg("success", "✓")} ${fg("toolTitle", bold(item.name))} ${fg("dim", `· ${aggregateLabel(item)}`)}`
+				: this.toolRow(rail, item.tool, frame, true));
 		}
-		if (shown < total) {
-			lines.push(`${fg("dim", "│  ")} ${fg("muted", `… +${total - shown} more`)}`);
-		}
-		if (keepThinking && lines.length < maxLines) {
+		if (selection.showThinking) {
 			const tokenLabel = this.liveThinkingTokenLabel();
-			const previewLimit = Math.max(1, Math.min(50, width - GROUP_PADDING_X - 18 - tokenLabel.length));
-			lines.push(
-				`${fg("dim", "└  ")}${fg("muted", "·")} ${fg("thinkingText", `thinking: ${oneLine(tText, previewLimit)}`)} ${fg("muted", `· ${tokenLabel}`)}`,
-			);
+			const previewWidth = Math.max(1, Math.min(50, width - GROUP_PADDING_X - 18 - tokenLabel.length));
+			lines.push(`${fg("dim", "└  ")}${fg("muted", "·")} ${fg("thinkingText", `thinking: ${oneLine(thinking, previewWidth)}`)} ${fg("muted", `· ${tokenLabel}`)}`);
 		}
-
 		if (this.hasPending() || this.liveThinkingActive()) scheduleAnimation();
 		return lines;
 	}
@@ -1032,15 +1272,7 @@ class ToolGroupComponent extends Container {
 		const frame = SPINNER[Math.floor((Date.now() - spinnerStart) / SPINNER_MS) % SPINNER.length]!;
 		const lines: string[] = [];
 
-		const hasPendingTool = this.hasPending();
-		const isThinking = this.liveThinkingActive();
-		const openNoTools = !this.sealed && this.children.length === 0;
-		const working = hasPendingTool || isThinking || openNoTools;
-		const state = hasPendingTool ? "tool calling..." : isThinking || openNoTools ? "thinking..." : "tools done";
-		const stateColor = hasPendingTool ? "accent" : isThinking || openNoTools ? "thinkingText" : "success";
-		// Left icon: spinner while working, completion mark once the group is done.
-		const leftIcon = working ? frame : "✓";
-		lines.push(`${fg(stateColor, leftIcon)} ${fg(stateColor, state)}`);
+		lines.push(this.header(frame, fg));
 
 		const total = this.children.length;
 		for (let index = 0; index < total; index++) {
@@ -1049,21 +1281,39 @@ class ToolGroupComponent extends Container {
 			const rail = isLast ? "└─ " : "├─ ";
 			const sub = isLast ? "    " : "│   ";
 			lines.push(this.toolRow(rail, tool, frame));
-			const result = toolResultText(tool);
-			if (result) {
-				const markdownWidth = Math.max(1, width - GROUP_PADDING_X - sub.length);
-				const preview = this.renderMarkdownPreview(
-					`tool:${tool.toolCallId ?? index}`,
-					result,
-					markdownWidth,
-					config.expandedToolLines,
-					{ color: (text) => currentTheme?.fg?.("toolOutput", text) ?? text },
-				);
-				for (const row of preview.lines) {
-					lines.push(`${fg("dim", sub)}${row}`);
+
+			// Highlight diff for edit tool if valid details.diff exists
+			const markdownWidth = Math.max(1, width - GROUP_PADDING_X - sub.length);
+			let diffRendered = false;
+			if (tool?.toolName === "edit" && tool?.result?.details && !tool?.result?.isError) {
+				const editDiff = renderEditDiff(tool.result.details.diff, markdownWidth, config.expandedToolLines, currentTheme);
+				if (editDiff) {
+					for (const row of editDiff.lines) {
+						lines.push(`${fg("dim", sub)}${row}`);
+					}
+					if (editDiff.truncated) {
+						lines.push(`${fg("dim", sub)}${fg("muted", "…")}`);
+					}
+					diffRendered = true;
 				}
-				if (preview.truncated) {
-					lines.push(`${fg("dim", sub)}${fg("muted", "…")}`);
+			}
+
+			if (!diffRendered) {
+				const result = toolResultText(tool);
+				if (result) {
+					const preview = this.renderMarkdownPreview(
+						`tool:${tool.toolCallId ?? index}`,
+						result,
+						markdownWidth,
+						config.expandedToolLines,
+						{ color: (text) => currentTheme?.fg?.("toolOutput", text) ?? text },
+					);
+					for (const row of preview.lines) {
+						lines.push(`${fg("dim", sub)}${row}`);
+					}
+					if (preview.truncated) {
+						lines.push(`${fg("dim", sub)}${fg("muted", "…")}`);
+					}
 				}
 			}
 		}
@@ -1199,19 +1449,10 @@ function flushPendingTextSeal(): void {
 		if (pendingTextOrdinal !== null) {
 			anchorGroupBeforeCurrentText(lastActiveGroup, pendingTextOrdinal);
 		}
-		lastActiveGroup.sealed = true;
-		lastActiveGroup.thinkingFrozen = thinkingText;
-		lastActiveGroup.thinkingTokensFrozen = thinkingTokenCount;
-		lastActiveGroup.thinkingTokensFrozenExact = thinkingTokenCountExact;
-		lastActiveGroup.invalidate();
+		lastActiveGroup.seal();
 		pendingTextSeal = false;
 		pendingTextOrdinal = null;
-		thinkingActive = false;
-		thinkingText = "";
-		thinkingTokenCount = 0;
-		thinkingTokenCountExact = false;
-		thinkingBlocks.clear();
-		assistantThinkingStarted = false;
+		resetThinking();
 		return;
 	}
 
@@ -1230,8 +1471,8 @@ function maybeGroup(parent: any, component: any): void {
 			const standaloneList = config.standaloneTools;
 			if (toolName && Array.isArray(standaloneList) && standaloneList.includes(toolName)) {
 				if (lastActiveGroup && !lastActiveGroup.sealed) {
-					lastActiveGroup.sealed = true;
-					lastActiveGroup.invalidate();
+					lastActiveGroup.seal();
+					resetThinking();
 					lastActiveGroup = null;
 				}
 			}
@@ -1690,11 +1931,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("tool_execution_end", async (event) => {
 		toolEnds.set(event.toolCallId, Date.now());
-		for (const g of groups) {
-			for (const t of g.children as any[]) {
-				if (t.toolCallId === event.toolCallId) t._groupEndAt = Date.now();
-			}
-		}
 		lastActiveGroup?.invalidate();
 	});
 
@@ -1704,20 +1940,12 @@ export default function (pi: ExtensionAPI) {
 		// open. Assistant/toolResult message boundaries do NOT seal — thinking and
 		// tool calls stay in one block until real (non-thinking) text appears.
 		if (role === "user" && lastActiveGroup && !lastActiveGroup.sealed) {
-			lastActiveGroup.sealed = true;
-			lastActiveGroup.thinkingFrozen = thinkingText;
-			lastActiveGroup.thinkingTokensFrozen = thinkingTokenCount;
-			lastActiveGroup.thinkingTokensFrozenExact = thinkingTokenCountExact;
+			lastActiveGroup.seal();
 		}
 		if (role === "user") {
 			turnStartMs = Date.now();
-			thinkingActive = false;
-			thinkingText = "";
-			thinkingTokenCount = 0;
-			thinkingTokenCountExact = false;
+			resetThinking();
 			handledTextIndexes.clear();
-			thinkingBlocks.clear();
-			assistantThinkingStarted = false;
 			pendingTextSeal = false;
 			pendingTextOrdinal = null;
 			lastStreamingComp = null;
@@ -1727,7 +1955,7 @@ export default function (pi: ExtensionAPI) {
 			// new thinking or emits text that seals the open tool group.
 			handledTextIndexes.clear();
 			assistantThinkingStarted = false;
-			thinkingActive = false;
+			stopThinking();
 			pendingTextSeal = false;
 			pendingTextOrdinal = null;
 			// Do not insert early thinking beside the previous assistant message.
@@ -1749,6 +1977,9 @@ export default function (pi: ExtensionAPI) {
 			// text boundary; scanning all content would resurrect that old block.
 			if (!assistantThinkingStarted) {
 				thinkingBlocks.clear();
+				stopThinking();
+				thinkingElapsedMs = 0;
+				thinkingTimingKnown = false;
 				assistantThinkingStarted = true;
 			}
 			const contentIndex = Number(streamEvent.contentIndex);
@@ -1762,7 +1993,12 @@ export default function (pi: ExtensionAPI) {
 			if (Number.isInteger(contentIndex)) thinkingBlocks.set(contentIndex, blockText);
 			thinkingText = [...thinkingBlocks.values()].filter((text) => text.trim()).join("\n\n");
 			updateThinkingTokenCount(msg);
-			thinkingActive = streamType !== "thinking_end";
+			if (streamType === "thinking_end") stopThinking();
+			else {
+				thinkingStartedAt ??= Date.now();
+				thinkingTimingKnown = true;
+				thinkingActive = true;
+			}
 			// Show a collapsed block as soon as thinking appears (no tool needed).
 			ensureThinkingGroup();
 		} else if (streamType.startsWith("text_")) {
@@ -1772,6 +2008,7 @@ export default function (pi: ExtensionAPI) {
 			// The first non-whitespace text is a boundary. Deduplicate by content
 			// index so every later cumulative delta extends the same text block.
 			if (text.length > 0 && !handledTextIndexes.has(contentIndex)) {
+				stopThinking();
 				if (thinkingText.trim()) updateThinkingTokenCount(msg);
 				handledTextIndexes.add(contentIndex);
 				pendingTextSeal = true;
@@ -1783,7 +2020,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		} else if (streamType === "done" || streamType === "error") {
 			if (thinkingText.trim()) updateThinkingTokenCount(msg);
-			thinkingActive = false;
+			stopThinking();
 		}
 
 		// Refresh the active block when thinking starts/stops (event-driven only;
@@ -1795,22 +2032,14 @@ export default function (pi: ExtensionAPI) {
 		// Turn finished: freeze the final block so it stops spinning and shows a
 		// stable summary until the user starts the next turn.
 		if (lastActiveGroup && !lastActiveGroup.sealed) {
-			lastActiveGroup.sealed = true;
-			lastActiveGroup.thinkingFrozen = thinkingText;
-			lastActiveGroup.thinkingTokensFrozen = thinkingTokenCount;
-			lastActiveGroup.thinkingTokensFrozenExact = thinkingTokenCountExact;
+			lastActiveGroup.seal();
 		}
 		// Separate the final visible text from the preceding work with a divider
 		// that reports how long this turn ran.
 		const elapsedMs = Date.now() - turnStartMs;
 		insertTurnDivider(elapsedMs);
-		thinkingActive = false;
-		thinkingText = "";
-		thinkingTokenCount = 0;
-		thinkingTokenCountExact = false;
+		resetThinking();
 		handledTextIndexes.clear();
-		thinkingBlocks.clear();
-		assistantThinkingStarted = false;
 		pendingTextSeal = false;
 		pendingTextOrdinal = null;
 	});
