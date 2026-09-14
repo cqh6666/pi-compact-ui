@@ -43,6 +43,7 @@ pi -e /absolute/path/to/pi-compact-ui/index.ts
 | Failure previews | The first failed tool and its cause take priority in the collapsed view |
 | File links | Common leading error locations link to local files in supported terminals |
 | Full logs | Expanded Bash results expose a supplied `fullOutputPath` outside the preview limit |
+| Subagent delegates | Formatted cards for `acp_delegate` / `subagent` with `⚡` badge, agent role, task summary, and hyperlinked output file paths |
 | Result summaries | Read line counts, edit additions/deletions, grep matches, search result counts, and confirmed Bash exit codes |
 | Execution phases | Displays reported phases before long arguments, then clears them on completion |
 | Edit diffs | Theme-colored additions, deletions, and context within the preview limit |
@@ -179,6 +180,11 @@ limit, although its displayed path is clipped to terminal width. The full URL
 remains in the link. It does not reconstruct truncated output or create logs for
 other tools. A log may have been deleted since execution; file existence is not
 checked during rendering.
+
+Subagent delegate tools (`acp_delegate`, `acp_delegate_wait`, `acp_delegate_cancel`,
+`subagent`) display a distinct `⚡` badge, agent role brackets (e.g. `[reviewer]`,
+`[worker]`), quoted task descriptions, and exit or dispatch status. When expanded,
+supplied output file paths display as hyperlinked `Delegate output: <path>` entries.
 
 Secondary transcripts can supply each tool's `cwd` for relative links. Without
 it, only absolute paths are linked.
