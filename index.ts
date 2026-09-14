@@ -205,6 +205,7 @@ let lastActiveGroup: ToolGroupComponent | null = null;
 let lastStreamingComp: any = null;
 let lastChatContainer: any = null;
 const toolStarts = new Map<string, number>();
+const toolEnds = new Map<string, number>();
 // Wall-clock start of the current turn (user message), used to render the
 // "worked for Xm Ys" divider before the final visible text.
 let turnStartMs = 0;
@@ -278,9 +279,14 @@ function toolStatus(tool: any): ToolStatus {
 }
 
 function toolElapsed(tool: any): string {
-	const start = toolStarts.get(tool.toolCallId) ?? Date.now();
-	const end = tool?.result ? tool._groupEndAt ?? Date.now() : Date.now();
-	return ((end - start) / 1000).toFixed(1);
+	const start = toolStarts.get(tool?.toolCallId) ?? Date.now();
+	if (!tool?.result) {
+		return ((Date.now() - start) / 1000).toFixed(1);
+	}
+	if (tool._groupEndAt === undefined) {
+		tool._groupEndAt = toolEnds.get(tool?.toolCallId) ?? Date.now();
+	}
+	return ((tool._groupEndAt - start) / 1000).toFixed(1);
 }
 
 function toolResultText(tool: any): string {
@@ -1683,6 +1689,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_execution_end", async (event) => {
+		toolEnds.set(event.toolCallId, Date.now());
 		for (const g of groups) {
 			for (const t of g.children as any[]) {
 				if (t.toolCallId === event.toolCallId) t._groupEndAt = Date.now();
