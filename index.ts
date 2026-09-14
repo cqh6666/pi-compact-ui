@@ -678,7 +678,7 @@ function renderCompressRows(tool: any, width: number): string[] {
 	const theme = currentTheme;
 	const fg = (color: string, text: string) => theme?.fg?.(color, text) ?? text;
 	const bold = theme?.bold ? theme.bold : (t: string) => t;
-	const padding = "  ";
+	const padding = " ".repeat(Math.min(GROUP_PADDING_X, Math.max(0, width - 1)));
 	const contentWidth = Math.max(1, width - padding.length);
 
 	const isPending = tool.isPartial === true || (tool.executionStarted && !tool.result);
@@ -687,12 +687,12 @@ function renderCompressRows(tool: any, width: number): string[] {
 	if (isPending) {
 		scheduleAnimation();
 		const line = `${fg("accent", frame)} ${fg("accent", bold("▣ ACP Context"))} ${fg("dim", "compressing context...")} ${fg("dim", "·")} ${fg("muted", `${toolElapsed(tool)}s`)}`;
-		return [padding + truncateToWidth(line, contentWidth, "…")];
+		return ["", padding + truncateToWidth(line, contentWidth, "…")];
 	}
 
 	if (tool.result?.isError) {
 		const line = `${fg("error", "✗")} ${fg("error", bold("▣ ACP Context"))} ${fg("error", "compression failed")} ${fg("dim", "·")} ${fg("muted", `${toolElapsed(tool)}s`)}`;
-		return [padding + truncateToWidth(line, contentWidth, "…")];
+		return ["", padding + truncateToWidth(line, contentWidth, "…")];
 	}
 
 	const output = (tool.result?.content ?? [])
@@ -772,7 +772,7 @@ function renderCompressRows(tool: any, width: number): string[] {
 		}
 	}
 
-	return lines;
+	return ["", ...lines];
 }
 
 function installToolExecutionCustomRendering(): void {
