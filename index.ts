@@ -1110,7 +1110,7 @@ function renderCompressRows(tool: any, width: number): string[] {
 const DELEGATE_STANDALONE_TOOLS = new Set(["acp_delegate", "acp_delegate_wait", "acp_delegate_cancel", "subagent"]);
 
 export function renderDelegateStandaloneRows(tool: any, width: number): string[] {
-	const theme = currentTheme;
+	const theme = currentTheme || tool.ui?.theme;
 	const fg = (color: string, text: string) => theme?.fg?.(color, text) ?? text;
 	const bold = theme?.bold ? theme.bold : (t: string) => t;
 	const padding = "  ";
@@ -1190,25 +1190,37 @@ export function renderDelegateStandaloneRows(tool: any, width: number): string[]
 		lines.push(padding + "  " + fg("muted", "(Ctrl+O to collapse)"));
 	}
 
-	return ["", ...lines];
+	return lines;
 }
+
+const WRAPPED_RENDER_KEY = Symbol.for("pi-compact-ui.tool-execution-wrapped-render");
+const TOOL_EXECUTION_HANDLERS_KEY = Symbol.for("pi-compact-ui.tool-execution-handlers");
 
 function installToolExecutionCustomRendering(): void {
 	const prototype = ToolExecutionComponent.prototype as any;
+
+	const handlers = prototype[TOOL_EXECUTION_HANDLERS_KEY] || {};
+	handlers.compress = renderCompressRows;
+	for (const name of DELEGATE_STANDALONE_TOOLS) {
+		handlers[name] = renderDelegateStandaloneRows;
+	}
+	prototype[TOOL_EXECUTION_HANDLERS_KEY] = handlers;
 	prototype[TOOL_EXECUTION_PATCH_KEY] = renderCompressRows;
-	if (prototype[TOOL_EXECUTION_INSTALLED_KEY]) return;
-	const originalRender = prototype.render;
-	prototype.render = function (this: any, width: number): string[] {
-		if (this.toolName === "compress") {
-			const handler = prototype[TOOL_EXECUTION_PATCH_KEY] || renderCompressRows;
-			return handler(this, width);
+
+	if (prototype.render && prototype.render[WRAPPED_RENDER_KEY]) {
+		return;
+	}
+
+	const prevRender = prototype.render;
+	const wrappedRender = function (this: any, width: number): string[] {
+		const currentHandlers = prototype[TOOL_EXECUTION_HANDLERS_KEY];
+		if (currentHandlers && typeof currentHandlers[this.toolName] === "function") {
+			return currentHandlers[this.toolName](this, width);
 		}
-		if (DELEGATE_STANDALONE_TOOLS.has(this.toolName)) {
-			return renderDelegateStandaloneRows(this, width);
-		}
-		return originalRender.call(this, width);
+		return prevRender.call(this, width);
 	};
-	prototype[TOOL_EXECUTION_INSTALLED_KEY] = true;
+	wrappedRender[WRAPPED_RENDER_KEY] = true;
+	prototype.render = wrappedRender;
 }
 
 /**
