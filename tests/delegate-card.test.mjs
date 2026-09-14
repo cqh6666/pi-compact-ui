@@ -7,7 +7,7 @@ import { Container, getCapabilities, setCapabilities, stripTerminalSequences, vi
 import { loadExtension } from "./load-extension.mjs";
 
 const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
-const { initTheme } = requireFromPi(fileURLToPath(new URL("./modes/interactive/theme/theme.js", import.meta.resolve("@earendil-works/pi-coding-agent"))));
+const { initTheme, getThemeByName } = requireFromPi(fileURLToPath(new URL("./modes/interactive/theme/theme.js", import.meta.resolve("@earendil-works/pi-coding-agent"))));
 initTheme("dark");
 
 const { default: install, delegateOutputEntry, renderDelegateStandaloneRows, CompactExternalGroupComponent } = await loadExtension();
@@ -188,4 +188,21 @@ test("renderDelegateStandaloneRows renders standalone task card in pending, comp
 	assert.match(expandedText, /> Step 1: Plan/);
 	assert.match(expandedText, /Ctrl\+O to collapse/);
 	assert.match(expandedRows.join("\n"), /\x1b\]8;;file:\/\/\/tmp\/plan\.md/);
+});
+
+test("renderDelegateStandaloneRows supports the active pi theme", () => {
+	const theme = getThemeByName("dark");
+	assert.ok(theme, "dark theme must be available");
+
+	const rows = renderDelegateStandaloneRows(
+		{
+			toolName: "acp_delegate",
+			args: { agent: "worker", task: "Render with the active theme" },
+			executionStarted: true,
+			ui: { theme },
+		},
+		120,
+	);
+
+	assert.match(rows.join("\n"), /Render with the active theme/);
 });

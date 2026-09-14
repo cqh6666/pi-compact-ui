@@ -1147,13 +1147,13 @@ export function renderDelegateStandaloneRows(tool: any, width: number): string[]
 
 	let singleLine = "";
 	if (isPending) {
-		singleLine = `${fg("accent", frame)} ${fg("accent", bold(title))}  ${fg("foreground", taskSummary)}  ${fg("muted", `(running · ${elapsed})`)}`;
+		singleLine = `${fg("accent", frame)} ${fg("accent", bold(title))}  ${fg("text", taskSummary)}  ${fg("muted", `(running · ${elapsed})`)}`;
 	} else if (tool.result?.isError) {
 		const statusText = stats || "failed";
-		singleLine = `${fg("error", "✗")} ${fg("error", bold(title))}  ${fg("foreground", taskSummary)}  ${fg("dim", "·")} ${fg("error", statusText)}  ${fg("muted", `(${elapsed})`)}`;
+		singleLine = `${fg("error", "✗")} ${fg("error", bold(title))}  ${fg("text", taskSummary)}  ${fg("dim", "·")} ${fg("error", statusText)}  ${fg("muted", `(${elapsed})`)}`;
 	} else {
 		const statsDisplay = stats ? `${fg("dim", "·")} ${fg("toolTitle", stats)}  ` : "";
-		singleLine = `${fg("success", "✓")} ${fg("accent", bold(title))}  ${fg("foreground", taskSummary)}  ${statsDisplay}${fg("muted", `(${elapsed})`)}`;
+		singleLine = `${fg("success", "✓")} ${fg("accent", bold(title))}  ${fg("text", taskSummary)}  ${statsDisplay}${fg("muted", `(${elapsed})`)}`;
 	}
 
 	const lines: string[] = [padding + truncateToWidth(singleLine, contentWidth, "…")];
