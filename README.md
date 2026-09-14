@@ -41,6 +41,8 @@ pi -e /absolute/path/to/pi-compact-ui/index.ts
 | Stable timing | Completed durations freeze; missing historical timing displays `—s` |
 | Thinking | Token usage and locally observed duration, excluding gaps between thinking segments |
 | Failure previews | The first failed tool and its cause take priority in the collapsed view |
+| File links | Common leading error locations link to local files in supported terminals |
+| Full logs | Expanded Bash results expose a supplied `fullOutputPath` outside the preview limit |
 | Result summaries | Read line counts, edit additions/deletions, grep matches, search result counts, and confirmed Bash exit codes |
 | Execution phases | Displays reported phases before long arguments, then clears them on completion |
 | Edit diffs | Theme-colored additions, deletions, and context within the preview limit |
@@ -156,6 +158,30 @@ existing `compress` tool; it does not provide context compression itself.
   Thinking yields space when the line limit requires it.
 - Expanded results and diffs remain bounded previews. An ellipsis indicates omitted
   lines; expanding a group does not guarantee the entire raw result is shown.
+
+## File locations and full logs
+
+Explicitly failed tool output can link leading diagnostic locations such as
+`src/app.ts(42,7)` and `src/app.ts:42:7`. Relative paths resolve against the tool's
+working directory. This supports common local POSIX paths; ambiguous text and
+locations split across wrapped rows may remain plain text. If a shell command
+changes directory internally, its relative diagnostics may need to be emitted as
+absolute paths for correct links.
+
+Links use `file://` URLs and Pi's OSC 8 terminal capability detection. They open
+files using the terminal's configured handler; visible line and column numbers
+are preserved, but exact editor line navigation is not guaranteed. Unsupported
+terminals retain readable text. No editor command is executed by this extension.
+
+Expanded Bash results show `Full output: <path>` when the tool supplies a valid
+`details.fullOutputPath`. This entry remains outside the result-preview line
+limit, although its displayed path is clipped to terminal width. The full URL
+remains in the link. It does not reconstruct truncated output or create logs for
+other tools. A log may have been deleted since execution; file existence is not
+checked during rendering.
+
+Secondary transcripts can supply each tool's `cwd` for relative links. Without
+it, only absolute paths are linked.
 
 ## Controls
 

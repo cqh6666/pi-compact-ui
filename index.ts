@@ -40,6 +40,8 @@ import {
 	SettingsList,
 	Spacer,
 	Text,
+	getCapabilities,
+	hyperlink,
 	matchesKey,
 	stripTerminalSequences,
 	truncateToWidth,
@@ -49,7 +51,8 @@ import {
 import type { Component, DefaultTextStyle, MarkdownTheme, SettingItem } from "@earendil-works/pi-tui";
 import { readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
-import { join } from "path";
+import { isAbsolute, join, resolve } from "path";
+import { pathToFileURL } from "node:url";
 
 // =============================================================================
 // Config
@@ -343,6 +346,37 @@ export function extractFailureReason(result: ToolResultSummary | undefined): str
 	return lines.find((line) => !/^(?:>|at\s|command failed:?$|failed with \d+ errors?$)/i.test(line)) ?? lines[0];
 }
 
+function localPath(value: unknown, cwd?: string): string | undefined {
+	if (typeof value !== "string" || !value.trim() || /[\x00-\x1f\x7f-\x9f]/.test(value) || /^[a-z][a-z\d+.-]*:/i.test(value)) return undefined;
+	if (isAbsolute(value)) return value;
+	if (!cwd || !isAbsolute(cwd) || /[\x00-\x1f\x7f-\x9f]/.test(cwd)) return undefined;
+	return resolve(cwd, value);
+}
+
+export function linkErrorLocation(row: string, cwd?: string): string {
+	if (!getCapabilities().hyperlinks) return row;
+	const text = stripTerminalSequences(row);
+	// Restrict links to leading diagnostic locations, rather than guessing paths in prose.
+	const match = text.match(/^\s*([^<>:"|?*\x00-\x1f]+?)(\([1-9]\d*(?:,[1-9]\d*)?\)|:[1-9]\d*(?::[1-9]\d*)?)(?=[:\s)]|$)/);
+	if (!match) return row;
+	if (!match[2].startsWith("(") && !/^:\d+:\d+$/.test(match[2]) && text[match[0].length] !== ":") return row;
+	const path = match[1].trim();
+	if (!isAbsolute(path) && !path.startsWith("./") && !path.startsWith("../") && /\s/.test(path.split("/")[0])) return row;
+	if (!isAbsolute(path) && !path.includes("/") && !/\.[a-z\d]+$/i.test(path)) return row;
+	const target = localPath(path, cwd);
+	const label = `${path}${match[2]}`;
+	if (!target || !row.includes(label)) return row;
+	return row.replace(label, hyperlink(label, pathToFileURL(target).href));
+}
+
+export function fullOutputEntry(name: string, details: unknown, cwd?: string): string | undefined {
+	if (name !== "bash" || !details || typeof details !== "object" || !("fullOutputPath" in details)) return undefined;
+	const path = localPath(details.fullOutputPath, cwd);
+	if (!path) return undefined;
+	const label = shortenPath(path);
+	return `Full output: ${getCapabilities().hyperlinks ? hyperlink(label, pathToFileURL(path).href) : label}`;
+}
+
 export function renderEditDiff(
 	diff: unknown,
 	width: number,
@@ -605,6 +639,7 @@ export function normalizeCompactCodeBlockLines(lines: string[], width: number, p
 
 export type CompactExternalTool = {
 	id: string;
+	cwd?: string;
 	name: string;
 	args: any;
 	status: ToolStatus;
@@ -680,7 +715,9 @@ export class CompactExternalGroupComponent implements Component {
 			const stats = resultSummary(tool.name, result);
 			if (reason) summary.content = `${reason}${stats ? ` · ${stats}` : ""}`;
 		}
-		return `${fg("dim", rail)}${fg(this.color(tool), this.icon(tool, frame))} ${fg("toolTitle", bold(summary.name))} ${fg(tool.status === "error" ? "error" : "dim", oneLine(summary.content, 500))} ${fg("muted", `(${this.elapsed(tool)})`)}`;
+		const content = oneLine(summary.content, 500);
+		const display = previewFailure && tool.status === "error" ? linkErrorLocation(content, tool.cwd) : content;
+		return `${fg("dim", rail)}${fg(this.color(tool), this.icon(tool, frame))} ${fg("toolTitle", bold(summary.name))} ${fg(tool.status === "error" ? "error" : "dim", display)} ${fg("muted", `(${this.elapsed(tool)})`)}`;
 	}
 
 	private tokenLabel(): string {
@@ -761,9 +798,11 @@ export class CompactExternalGroupComponent implements Component {
 					config.expandedToolLines,
 					"toolOutput",
 				)) {
-					lines.push(`${fg("dim", sub)}${row}`);
+					lines.push(`${fg("dim", sub)}${tool.status === "error" ? linkErrorLocation(row, tool.cwd) : row}`);
 				}
 			}
+			const fullOutput = fullOutputEntry(tool.name, tool.resultDetails, tool.cwd);
+			if (fullOutput) lines.push(`${fg("dim", sub)}${fg("accent", fullOutput)}`);
 		}
 		if (this.state.thinking.trim()) {
 			lines.push(
@@ -1211,7 +1250,9 @@ class ToolGroupComponent extends Container {
 			const stats = resultSummary(tool.toolName, tool.result);
 			if (reason) s.content = `${reason}${stats ? ` · ${stats}` : ""}`;
 		}
-		return `${fg("dim", rail)}${fg(this.colorFor(st), this.iconFor(tool, frame))} ${fg("toolTitle", bold(s.name))} ${fg(st === "error" ? "error" : "dim", oneLine(s.content, 500))} ${fg("muted", `(${toolElapsed(tool)}s)`)}`;
+		const content = oneLine(s.content, 500);
+		const display = previewFailure && st === "error" ? linkErrorLocation(content, tool.cwd) : content;
+		return `${fg("dim", rail)}${fg(this.colorFor(st), this.iconFor(tool, frame))} ${fg("toolTitle", bold(s.name))} ${fg(st === "error" ? "error" : "dim", display)} ${fg("muted", `(${toolElapsed(tool)}s)`)}`;
 	}
 	// Live state only applies to the not-yet-sealed (active) block.
 	private liveThinking(): string {
@@ -1309,13 +1350,15 @@ class ToolGroupComponent extends Container {
 						{ color: (text) => currentTheme?.fg?.("toolOutput", text) ?? text },
 					);
 					for (const row of preview.lines) {
-						lines.push(`${fg("dim", sub)}${row}`);
+						lines.push(`${fg("dim", sub)}${toolStatus(tool) === "error" ? linkErrorLocation(row, tool.cwd) : row}`);
 					}
 					if (preview.truncated) {
 						lines.push(`${fg("dim", sub)}${fg("muted", "…")}`);
 					}
 				}
 			}
+			const fullOutput = fullOutputEntry(tool.toolName, tool.result?.details, tool.cwd);
+			if (fullOutput) lines.push(`${fg("dim", sub)}${fg("accent", fullOutput)}`);
 		}
 
 		const tText = this.liveThinking().trim();
