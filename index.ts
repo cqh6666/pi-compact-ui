@@ -636,6 +636,111 @@ function installCompactionSummaryRendering(): void {
 	};
 }
 
+const TOOL_EXECUTION_PATCH_KEY = Symbol.for("pi-compact-ui.tool-execution-patch");
+
+function renderCompressRows(tool: any, width: number): string[] {
+	const theme = currentTheme;
+	const fg = (color: string, text: string) => theme?.fg?.(color, text) ?? text;
+	const bold = theme?.bold ? theme.bold : (t: string) => t;
+	const padding = "  ";
+	const contentWidth = Math.max(1, width - padding.length);
+
+	const isPending = tool.isPartial === true || (tool.executionStarted && !tool.result);
+	const frame = SPINNER[Math.floor((Date.now() - spinnerStart) / SPINNER_MS) % SPINNER.length]!;
+
+	if (isPending) {
+		scheduleAnimation();
+		const line = `${fg("accent", frame)} ${fg("accent", bold("▣ ACP"))} ${fg("dim", "compressing context...")} ${fg("muted", `(${toolElapsed(tool)}s)`)}`;
+		return [padding + truncateToWidth(line, contentWidth, "…")];
+	}
+
+	if (tool.result?.isError) {
+		const line = `${fg("error", "✗")} ${fg("error", bold("▣ ACP"))} ${fg("error", "compression failed")} ${fg("muted", `(${toolElapsed(tool)}s)`)}`;
+		return [padding + truncateToWidth(line, contentWidth, "…")];
+	}
+
+	const output = (tool.result?.content ?? [])
+		.filter((c: any) => c.type === "text")
+		.map((c: any) => String(c.text))
+		.join("\n")
+		.trim();
+
+	const firstLine = output.split("\n")[0]?.trim() ?? "";
+	let statsSummary = "";
+	const tokenMatch = firstLine.match(/(\d+(?:\.\d+)?[KkMmbB]?\s*→\s*\d+(?:\.\d+)?[KkMmbB]?\s*tokens?\s*(?:\(~[^)]+\))?)/i);
+	if (tokenMatch) {
+		statsSummary = tokenMatch[1].trim();
+	} else {
+		const pipeIdx = firstLine.indexOf("|");
+		if (pipeIdx >= 0) {
+			statsSummary = firstLine.slice(pipeIdx + 1).split(",")[0].trim();
+		} else {
+			statsSummary = firstLine.replace(/^▣\s*ACP\s*\|?\s*/i, "").trim() || "context compressed";
+		}
+	}
+
+	const singleLine = `${fg("success", "✓")} ${fg("accent", bold("▣ ACP"))} ${fg("dim", "·")} ${fg("toolTitle", statsSummary)} ${fg("muted", `(${toolElapsed(tool)}s)`)}`;
+
+	if (!tool.expanded) {
+		return [padding + truncateToWidth(singleLine, contentWidth, "…")];
+	}
+
+	const lines: string[] = [];
+	lines.push(padding + truncateToWidth(singleLine, contentWidth, "…"));
+
+	// Additional output lines (e.g. excluded messages warning)
+	const otherOutputLines = output.split("\n").slice(1).map((l) => l.trim()).filter(Boolean);
+	for (const line of otherOutputLines) {
+		lines.push(padding + "  " + fg("warning", truncateToWidth(line, contentWidth - 2, "…")));
+	}
+
+	// Detailed summary from args
+	const contentArg = tool.args?.content;
+	let ranges: any[] = [];
+	if (Array.isArray(contentArg)) {
+		ranges = contentArg;
+	} else if (typeof contentArg === "string") {
+		try {
+			const parsed = JSON.parse(contentArg);
+			if (Array.isArray(parsed)) ranges = parsed;
+		} catch {}
+	}
+
+	if (ranges.length > 0) {
+		for (const r of ranges) {
+			const topic = r.topic ? `[${r.topic}] ` : "";
+			const rangeRef = r.startId && r.endId ? `(${r.startId}..${r.endId})` : "";
+			lines.push(padding + "  " + fg("accent", `▼ ${topic}${rangeRef}`));
+			if (r.summary) {
+				const summaryLines = String(r.summary).split("\n");
+				const maxLines = Math.max(8, config.expandedToolLines * 3);
+				for (const sLine of summaryLines.slice(0, maxLines)) {
+					lines.push(padding + "    " + fg("dim", truncateToWidth(sLine, contentWidth - 4, "…")));
+				}
+				if (summaryLines.length > maxLines) {
+					lines.push(padding + "    " + fg("muted", `… +${summaryLines.length - maxLines} more lines`));
+				}
+			}
+		}
+	}
+
+	lines.push(padding + "  " + fg("muted", "(Ctrl+O to collapse)"));
+	return lines;
+}
+
+function installToolExecutionCustomRendering(): void {
+	const prototype = ToolExecutionComponent.prototype as any;
+	if (prototype[TOOL_EXECUTION_PATCH_KEY]) return;
+	const originalRender = prototype.render;
+	prototype.render = function (this: any, width: number): string[] {
+		if (this.toolName === "compress") {
+			return renderCompressRows(this, width);
+		}
+		return originalRender.call(this, width);
+	};
+	prototype[TOOL_EXECUTION_PATCH_KEY] = true;
+}
+
 /**
  * Pi's hidden-thinking mode still renders one Text component per thinking run.
  * Setting its label to "" hides the glyphs, but the Text itself still occupies
@@ -1074,7 +1179,6 @@ function maybeGroup(parent: any, component: any): void {
 					lastActiveGroup.invalidate();
 					lastActiveGroup = null;
 				}
-				(component as any).setExpanded?.(true);
 			}
 		}
 		return;
@@ -1490,6 +1594,7 @@ export default function (pi: ExtensionAPI) {
 	installGrouping();
 	installNativeThinkingSuppression();
 	installCompactionSummaryRendering();
+	installToolExecutionCustomRendering();
 
 	const delegate = (name: keyof ReturnType<typeof getTools>) =>
 		async (toolCallId: string, params: unknown, signal: AbortSignal, onUpdate?: unknown, ctx?: unknown) => {
@@ -1520,6 +1625,7 @@ export default function (pi: ExtensionAPI) {
 		installGrouping();
 		installNativeThinkingSuppression();
 		installCompactionSummaryRendering();
+		installToolExecutionCustomRendering();
 	});
 
 	pi.on("tool_execution_start", async (event) => {

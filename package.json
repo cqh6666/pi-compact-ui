@@ -1,6 +1,6 @@
 {
   "name": "pi-compact-ui",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Compact tree-shaped reasoning and tool-call UI for the Pi Coding Agent",
   "type": "module",
   "repository": {

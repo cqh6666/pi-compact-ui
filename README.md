@@ -86,7 +86,13 @@ Available settings:
 | `collapsedMaxLines` | `3` | Maximum lines shown while a group is collapsed |
 | `expandedToolLines` | `5` | Result-preview lines shown for each expanded tool |
 | `expandedThinkingLines` | `10` | Reasoning-preview lines shown while expanded |
-| `standaloneTools` | `["compress"]` | List of tool names to render standalone (unfolded) instead of collapsing into tree |
+| `standaloneTools` | `["compress"]` | List of tool names to render standalone instead of collapsing into the tool tree |
+
+### Compress Tool Rendering
+
+When `compress` is included in `standaloneTools`:
+- **Collapsed (default)**: Renders as **exactly 1 line** with key token savings (e.g. `✓ ▣ ACP · 47.5K → 19.5K tokens (~28.0K reclaimed) · (0.8s)`).
+- **Expanded (Ctrl+O)**: Expands to show the full summary of compressed blocks and topics. Press `Ctrl+O` again to collapse.
 
 The configuration is stored at:
 
