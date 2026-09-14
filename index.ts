@@ -686,12 +686,12 @@ function renderCompressRows(tool: any, width: number): string[] {
 
 	if (isPending) {
 		scheduleAnimation();
-		const line = `${fg("accent", frame)} ${fg("accent", bold("▣ ACP Context"))} ${fg("dim", "compressing context...")} ${fg("dim", "·")} ${fg("muted", `${toolElapsed(tool)}s`)}`;
+		const line = `${fg("accent", frame)} ${fg("accent", bold("compress"))} ${fg("dim", "compressing context...")} ${fg("dim", "·")} ${fg("muted", `${toolElapsed(tool)}s`)}`;
 		return ["", padding + truncateToWidth(line, contentWidth, "…")];
 	}
 
 	if (tool.result?.isError) {
-		const line = `${fg("error", "✗")} ${fg("error", bold("▣ ACP Context"))} ${fg("error", "compression failed")} ${fg("dim", "·")} ${fg("muted", `${toolElapsed(tool)}s`)}`;
+		const line = `${fg("error", "✗")} ${fg("error", bold("compress"))} ${fg("error", "compression failed")} ${fg("dim", "·")} ${fg("muted", `${toolElapsed(tool)}s`)}`;
 		return ["", padding + truncateToWidth(line, contentWidth, "…")];
 	}
 
@@ -731,7 +731,7 @@ function renderCompressRows(tool: any, width: number): string[] {
 		statsFormatted = fg("toolTitle", statsSummary);
 	}
 
-	const singleLine = `${fg("success", "✓")} ${fg("accent", bold("▣ ACP Context"))}  ${statsFormatted}  ${fg("dim", "·")} ${fg("muted", `${toolElapsed(tool)}s`)}`;
+	const singleLine = `${fg("success", "✓")} ${fg("accent", bold("compress"))}  ${statsFormatted}  ${fg("dim", "·")} ${fg("muted", `${toolElapsed(tool)}s`)}`;
 
 	const lines: string[] = [];
 	lines.push(padding + truncateToWidth(singleLine, contentWidth, "…"));
