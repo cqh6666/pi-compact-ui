@@ -733,10 +733,6 @@ function renderCompressRows(tool: any, width: number): string[] {
 
 	const singleLine = `${fg("success", "✓")} ${fg("accent", bold("▣ ACP Context"))}  ${statsFormatted}  ${fg("dim", "·")} ${fg("muted", `${toolElapsed(tool)}s`)}`;
 
-	if (!tool.expanded) {
-		return [padding + truncateToWidth(singleLine, contentWidth, "…")];
-	}
-
 	const lines: string[] = [];
 	lines.push(padding + truncateToWidth(singleLine, contentWidth, "…"));
 
@@ -776,7 +772,6 @@ function renderCompressRows(tool: any, width: number): string[] {
 		}
 	}
 
-	lines.push(padding + "  " + fg("muted", "(Ctrl+O to collapse)"));
 	return lines;
 }
 
