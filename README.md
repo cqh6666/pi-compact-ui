@@ -86,6 +86,7 @@ Available settings:
 | `collapsedMaxLines` | `3` | Maximum lines shown while a group is collapsed |
 | `expandedToolLines` | `5` | Result-preview lines shown for each expanded tool |
 | `expandedThinkingLines` | `10` | Reasoning-preview lines shown while expanded |
+| `standaloneTools` | `["compress"]` | List of tool names to render standalone (unfolded) instead of collapsing into tree |
 
 The configuration is stored at:
 
@@ -99,7 +100,10 @@ Example:
 {
   "collapsedMaxLines": 3,
   "expandedToolLines": 5,
-  "expandedThinkingLines": 10
+  "expandedThinkingLines": 10,
+  "standaloneTools": [
+    "compress"
+  ]
 }
 ```
 

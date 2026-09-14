@@ -55,10 +55,29 @@ import { join } from "path";
 // Config
 // =============================================================================
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "compact-ui.json");
-const DEFAULT_CONFIG = { collapsedMaxLines: 3, expandedToolLines: 5, expandedThinkingLines: 10 };
-let config = { ...DEFAULT_CONFIG };
+interface CompactUiConfig {
+	collapsedMaxLines: number;
+	expandedToolLines: number;
+	expandedThinkingLines: number;
+	standaloneTools?: string[];
+}
+
+const DEFAULT_CONFIG: CompactUiConfig = {
+	collapsedMaxLines: 3,
+	expandedToolLines: 5,
+	expandedThinkingLines: 10,
+	standaloneTools: ["compress"],
+};
+let config: CompactUiConfig = { ...DEFAULT_CONFIG };
 try {
-	config = { ...DEFAULT_CONFIG, ...JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) };
+	const loaded = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+	config = {
+		...DEFAULT_CONFIG,
+		...loaded,
+		standaloneTools: Array.isArray(loaded.standaloneTools)
+			? loaded.standaloneTools
+			: DEFAULT_CONFIG.standaloneTools,
+	};
 } catch {
 	// first run — use defaults
 }
@@ -963,7 +982,13 @@ function scheduleAnimation(): void {
 const groups = new Set<ToolGroupComponent>();
 
 function isGroupable(value: any): boolean {
-	return value instanceof ToolExecutionComponent;
+	if (!(value instanceof ToolExecutionComponent)) return false;
+	const toolName = (value as any).toolName;
+	const standaloneList = config.standaloneTools;
+	if (toolName && Array.isArray(standaloneList) && standaloneList.includes(toolName)) {
+		return false;
+	}
+	return true;
 }
 
 function previousGroupable(children: any[], start: number): { child: any; index: number } | undefined {
@@ -1039,7 +1064,21 @@ function flushPendingTextSeal(): void {
 }
 
 function maybeGroup(parent: any, component: any): void {
-	if (!isGroupable(component) || parent instanceof ToolGroupComponent) return;
+	if (!isGroupable(component) || parent instanceof ToolGroupComponent) {
+		if (parent && !(parent instanceof ToolGroupComponent) && component instanceof ToolExecutionComponent) {
+			const toolName = (component as any).toolName;
+			const standaloneList = config.standaloneTools;
+			if (toolName && Array.isArray(standaloneList) && standaloneList.includes(toolName)) {
+				if (lastActiveGroup && !lastActiveGroup.sealed) {
+					lastActiveGroup.sealed = true;
+					lastActiveGroup.invalidate();
+					lastActiveGroup = null;
+				}
+				(component as any).setExpanded?.(true);
+			}
+		}
+		return;
+	}
 	const children = parent?.children;
 	if (!Array.isArray(children)) return;
 	const index = children.indexOf(component);
