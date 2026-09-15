@@ -37,6 +37,7 @@ pi -e /absolute/path/to/pi-compact-ui/index.ts
 
 | Area | Behavior |
 |---|---|
+| Mouse expansion | Click a group, tool, or subagent card title to toggle it independently in fullscreen mode |
 | Group summaries | Tool count, failure count, and elapsed execution span |
 | Stable timing | Completed durations freeze; missing historical timing displays `—s` |
 | Thinking | Token usage and locally observed duration, excluding gaps between thinking segments |
@@ -193,11 +194,23 @@ it, only absolute paths are linked.
 
 | Action | Key |
 |---|---|
-| Expand or collapse tool groups and thinking | `Ctrl+O` (Pi default) |
+| Expand or collapse all tool groups and thinking | `Ctrl+O` (Pi default) |
+| Expand or collapse one group or subagent card | Left-click its title (fullscreen mode) |
+| Expand or collapse one tool's output inside an expanded group | Left-click the tool's summary row |
 | Move through settings | `Up` / `Down` |
 | Adjust a numeric setting | `Left` / `Right`, `-` / `+` |
 | Save a setting | `Enter` |
 | Close settings | `Esc` |
+
+Mouse expansion requires Pi's component mouse API (verified with Pi 0.85.1) and
+`fullscreen` mode. Click the visible group title to toggle the group. The first
+expansion shows every tool's preview; click an individual tool's summary row to
+hide or show only its output. Closing and reopening the group by mouse preserves
+these choices. Newly added tools show their previews when the group is expanded.
+`Ctrl+O` resets individual choices and sets the global expanded state.
+Output text, links, and padding retain their normal behavior. Modified clicks,
+dragging, and the scroll wheel do not toggle groups or tools. Compression summaries
+remain static. Secondary transcript hosts must forward mouse events to their components.
 
 ## Compatibility
 

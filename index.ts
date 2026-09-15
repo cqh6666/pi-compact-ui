@@ -48,7 +48,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import type { Component, DefaultTextStyle, MarkdownTheme, SettingItem } from "@earendil-works/pi-tui";
+import type { Component, DefaultTextStyle, MarkdownTheme, SettingItem, TuiMouseEvent, TuiMouseEventResult, TuiMouseDispatchResult } from "@earendil-works/pi-tui";
 import { readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { isAbsolute, join, resolve } from "path";
@@ -189,6 +189,7 @@ const COMPACTION_STYLE_PATCH_KEY = Symbol.for("compact-ui.compaction-style-patch
 const ASSISTANT_THINKING_PATCH_KEY = Symbol.for("compact-ui.assistant-thinking-patch");
 
 let currentTheme: any = null;
+let getToolsExpanded: (() => boolean) | undefined;
 let thinkingActive = false;
 let thinkingStartedAt: number | undefined;
 let thinkingElapsedMs = 0;
@@ -720,14 +721,61 @@ export type CompactExternalGroup = {
 	thinkingEndedAt?: number;
 };
 
-/**
- * Isolated compact-ui renderer for secondary transcripts (for example a
- * subagent overlay). It deliberately owns no main-session globals while using
- * the same colors, rails, Markdown/code rendering, limits, and expansion
- * behavior as ToolGroupComponent.
- */
+type HeaderBounds = { row: number; start: number; end: number };
+
+function getHeaderBounds(lines: string[], row: number, width: number): HeaderBounds {
+	return { row, start: Math.min(GROUP_PADDING_X, Math.max(0, width - 1)), end: visibleWidth(lines[row] ?? "") };
+}
+
+function isHeaderClick(event: TuiMouseEvent, bounds: HeaderBounds | undefined): boolean {
+	return event.type === "click" && event.button === "left" && (event.clickCount ?? 1) === 1
+		&& !event.shift && !event.alt && !event.ctrl
+		&& bounds !== undefined && event.y === bounds.row && event.x >= bounds.start && event.x < bounds.end;
+}
+
+class GroupExpansion<T> {
+	expanded = false;
+	private collapsedTools = new Set<T>();
+
+	setExpanded(expanded: boolean): void {
+		this.expanded = expanded;
+		this.collapsedTools.clear();
+	}
+
+	toggleGroup(): void {
+		this.expanded = !this.expanded;
+	}
+
+	toggleTool(tool: T): void {
+		if (!this.collapsedTools.delete(tool)) this.collapsedTools.add(tool);
+	}
+
+	isToolExpanded(tool: T): boolean {
+		return !this.collapsedTools.has(tool);
+	}
+
+	removeTool(tool: T): void {
+		this.collapsedTools.delete(tool);
+	}
+}
+
+/** Compact groups for secondary transcripts, with state owned by the caller. */
 export class CompactExternalGroupComponent implements Component {
-	private expanded = false;
+	private expansion = new GroupExpansion<string>();
+	private headerBounds: HeaderBounds | undefined;
+	private toolHeaders = new Map<string, HeaderBounds>();
+
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (isHeaderClick(event, this.headerBounds)) {
+			this.expansion.toggleGroup();
+		} else {
+			const entry = this.expansion.expanded && [...this.toolHeaders].find(([, bounds]) => isHeaderClick(event, bounds));
+			if (!entry) return undefined;
+			const [id] = entry;
+			this.expansion.toggleTool(id);
+		}
+		return { handled: true, render: true };
+	}
 
 	constructor(
 		readonly state: CompactExternalGroup,
@@ -735,7 +783,7 @@ export class CompactExternalGroupComponent implements Component {
 	) {}
 
 	setExpanded(expanded: boolean): void {
-		this.expanded = expanded;
+		this.expansion.setExpanded(expanded);
 	}
 
 	invalidate(): void {}
@@ -834,7 +882,9 @@ export class CompactExternalGroupComponent implements Component {
 			const tool = this.state.tools[index]!;
 			const last = index === this.state.tools.length - 1;
 			const sub = last ? "    " : "│   ";
+			this.toolHeaders.set(tool.id, { row: lines.length, start: 0, end: 0 });
 			lines.push(this.toolRow(last ? "└─ " : "├─ ", tool, frame));
+			if (!this.expansion.isToolExpanded(tool.id)) continue;
 
 			const subWidth = Math.max(1, width - GROUP_PADDING_X - sub.length);
 			let diffRendered = false;
@@ -885,10 +935,14 @@ export class CompactExternalGroupComponent implements Component {
 
 	render(width: number): string[] {
 		const frame = SPINNER[Math.floor((Date.now() - spinnerStart) / SPINNER_MS) % SPINNER.length]!;
-		const source = this.expanded ? this.renderExpanded(width, frame) : this.renderCollapsed(width, frame);
+		this.toolHeaders.clear();
+		const source = this.expansion.expanded ? this.renderExpanded(width, frame) : this.renderCollapsed(width, frame);
 		const padding = " ".repeat(Math.min(GROUP_PADDING_X, Math.max(0, width - 1)));
 		const contentWidth = Math.max(1, width - padding.length);
-		return source.map((line) => padding + truncateToWidth(line, contentWidth, "…"));
+		const rendered = source.map((line) => padding + truncateToWidth(line, contentWidth, "…"));
+		this.headerBounds = getHeaderBounds(rendered, 0, width);
+		for (const [id, bounds] of this.toolHeaders) this.toolHeaders.set(id, getHeaderBounds(rendered, bounds.row, width));
+		return rendered;
 	}
 }
 
@@ -1366,6 +1420,18 @@ export function renderDelegateStandaloneRows(tool: any, width: number): string[]
 
 const WRAPPED_RENDER_KEY = Symbol.for("pi-compact-ui.tool-execution-wrapped-render");
 const TOOL_EXECUTION_HANDLERS_KEY = Symbol.for("pi-compact-ui.tool-execution-handlers");
+const TOOL_HEADER_KEY = Symbol.for("pi-compact-ui.tool-header");
+const TOOL_RENDER_PATCH_KEY = Symbol.for("pi-compact-ui.tool-render-patch");
+const TOOL_MOUSE_PATCH_KEY = Symbol.for("pi-compact-ui.tool-mouse-patch");
+
+type ClickableTool = {
+	toolName: string;
+	expanded: boolean;
+	setExpanded(expanded: boolean): void;
+	_waitTool?: ClickableTool;
+	[TOOL_HEADER_KEY]?: HeaderBounds;
+};
+type ToolMouseHandler = (this: ClickableTool, event: TuiMouseEvent) => TuiMouseEventResult | undefined;
 
 function installToolExecutionCustomRendering(): void {
 	const prototype = ToolExecutionComponent.prototype as any;
@@ -1378,20 +1444,35 @@ function installToolExecutionCustomRendering(): void {
 	prototype[TOOL_EXECUTION_HANDLERS_KEY] = handlers;
 	prototype[TOOL_EXECUTION_PATCH_KEY] = renderCompressRows;
 
-	if (prototype.render && prototype.render[WRAPPED_RENDER_KEY]) {
-		return;
-	}
+	const previous = prototype[TOOL_MOUSE_PATCH_KEY] as { original: ToolMouseHandler; installed: ToolMouseHandler } | undefined;
+	const original = previous && prototype.handleMouse === previous.installed ? previous.original : prototype.handleMouse as ToolMouseHandler;
+	const installed: ToolMouseHandler = function (event) {
+		if (this.toolName === "compress") return undefined;
+		if (!DELEGATE_STANDALONE_TOOLS.has(this.toolName)) return original?.call(this, event);
+		// Custom card rows do not share the native tool's child layout.
+		if (!isHeaderClick(event, this[TOOL_HEADER_KEY])) return undefined;
+		const expanded = !(this.expanded || this._waitTool?.expanded);
+		this.setExpanded(expanded);
+		this._waitTool?.setExpanded(expanded);
+		return { handled: true, render: true };
+	};
+	prototype.handleMouse = installed;
+	prototype[TOOL_MOUSE_PATCH_KEY] = { original, installed };
 
-	const prevRender = prototype.render;
+	const previousRender = prototype[TOOL_RENDER_PATCH_KEY] as { original: (width: number) => string[]; installed: (width: number) => string[] } | undefined;
+	const prevRender = previousRender && prototype.render === previousRender.installed ? previousRender.original : prototype.render;
 	const wrappedRender = function (this: any, width: number): string[] {
 		const currentHandlers = prototype[TOOL_EXECUTION_HANDLERS_KEY];
 		if (currentHandlers && typeof currentHandlers[this.toolName] === "function") {
-			return currentHandlers[this.toolName](this, width);
+			const rows = currentHandlers[this.toolName](this, width);
+			this[TOOL_HEADER_KEY] = rows.length > 1 ? getHeaderBounds(rows, 1, width) : undefined;
+			return rows;
 		}
 		return prevRender.call(this, width);
 	};
 	wrappedRender[WRAPPED_RENDER_KEY] = true;
 	prototype.render = wrappedRender;
+	prototype[TOOL_RENDER_PATCH_KEY] = { original: prevRender, installed: wrappedRender };
 }
 
 /**
@@ -1446,9 +1527,31 @@ class ToolGroupComponent extends Container {
 	toolName = "group";
 	/** Nested at a visible-text boundary rather than rendered at chat level. */
 	anchored = false;
-	private _expanded = false;
+	/** Pi removes tools through the chat container even after their group is anchored. */
+	readonly chatContainer: Container;
+	private expansion = new GroupExpansion<Component>();
+	private headerBounds: HeaderBounds | undefined;
+	private toolHeaders = new Map<Component, HeaderBounds>();
+
+	handleMouse(event: TuiMouseEvent): TuiMouseDispatchResult | undefined {
+		// The child tools are rendered as rows, not through Container.render().
+		if (isHeaderClick(event, this.headerBounds)) {
+			this.expansion.toggleGroup();
+		} else {
+			const entry = this.expansion.expanded && [...this.toolHeaders].find(([, bounds]) => isHeaderClick(event, bounds));
+			if (!entry) return undefined;
+			const [tool] = entry;
+			this.expansion.toggleTool(tool);
+		}
+		return {
+			handled: true,
+			render: true,
+			target: { component: this, originX: event.screenX - event.x, originY: event.screenY - event.y, width: event.width, height: event.height },
+		};
+	}
+
 	get expanded(): boolean {
-		return this._expanded;
+		return this.expansion.expanded;
 	}
 	/** Sealed: this block was closed by real text output — render from snapshot only. */
 	sealed = false;
@@ -1460,8 +1563,10 @@ class ToolGroupComponent extends Container {
 	thinkingDurationFrozen: number | undefined;
 	private markdownPreviewCache = new Map<string, MarkdownPreview>();
 
-	constructor() {
+	constructor(chatContainer: Container, expanded = false) {
 		super();
+		this.chatContainer = chatContainer;
+		this.expansion.setExpanded(getToolsExpanded?.() ?? expanded);
 	}
 
 	seal(): void {
@@ -1475,9 +1580,8 @@ class ToolGroupComponent extends Container {
 	}
 
 	setExpanded(expanded: boolean): void {
-		this._expanded = expanded;
+		this.expansion.setExpanded(expanded);
 		for (const tool of this.children) tool.setExpanded?.(expanded);
-		this.invalidate();
 	}
 
 	addTool(tool: any): void {
@@ -1487,9 +1591,16 @@ class ToolGroupComponent extends Container {
 	}
 
 	removeTool(tool: any): void {
+		this.expansion.removeTool(tool);
+		this.markdownPreviewCache.delete(`tool:${tool.toolCallId}`);
+		this.toolHeaders.delete(tool);
 		const index = this.children.indexOf(tool);
 		if (index >= 0) this.children.splice(index, 1);
 		if ((tool as any)?.[PARENT_KEY] === this) delete (tool as any)[PARENT_KEY];
+	}
+
+	isEmpty(): boolean {
+		return this.children.length === 0 && !this.liveThinking().trim();
 	}
 
 	hasPending(): boolean {
@@ -1648,7 +1759,9 @@ class ToolGroupComponent extends Container {
 			const isLast = index === total - 1;
 			const rail = isLast ? "└─ " : "├─ ";
 			const sub = isLast ? "    " : "│   ";
+			this.toolHeaders.set(tool, { row: lines.length, start: 0, end: 0 });
 			lines.push(this.toolRow(rail, tool, frame));
+			if (!this.expansion.isToolExpanded(tool)) continue;
 
 			// Highlight diff for edit tool if valid details.diff exists
 			const markdownWidth = Math.max(1, width - GROUP_PADDING_X - sub.length);
@@ -1717,7 +1830,8 @@ class ToolGroupComponent extends Container {
 	}
 
 	render(width: number): string[] {
-		const lines = this._expanded ? this.renderExpanded(width) : this.renderCollapsed(width);
+		this.toolHeaders.clear();
+		const lines = this.expansion.expanded ? this.renderExpanded(width) : this.renderCollapsed(width);
 		// Indent compact blocks from the transcript edge while keeping every line
 		// within the terminal width (including mobile / narrow terminals).
 		const padding = " ".repeat(Math.min(GROUP_PADDING_X, Math.max(0, width - 1)));
@@ -1727,7 +1841,12 @@ class ToolGroupComponent extends Container {
 		// bypasses that child tree, so restore the same single leading gap while
 		// the group is top-level. Anchored groups receive deterministic spacing
 		// from placeAnchoredGroupBeforeText() instead.
-		return this.anchored ? rendered : ["", ...rendered];
+		const rows = this.anchored ? rendered : ["", ...rendered];
+		this.headerBounds = getHeaderBounds(rows, this.anchored ? 0 : 1, width);
+		for (const [tool, bounds] of this.toolHeaders) {
+			this.toolHeaders.set(tool, getHeaderBounds(rows, bounds.row + (this.anchored ? 0 : 1), width));
+		}
+		return rows;
 	}
 }
 
@@ -1795,7 +1914,7 @@ function ensureThinkingGroup(): void {
 	const children = parent.children;
 	if (!Array.isArray(children)) return;
 	const idx = children.indexOf(lastStreamingComp);
-	const group = new ToolGroupComponent();
+	const group = new ToolGroupComponent(parent);
 	children.splice(idx >= 0 ? idx + 1 : children.length, 0, group);
 	groups.add(group);
 	lastActiveGroup = group;
@@ -1866,7 +1985,7 @@ function maybeGroup(parent: any, component: any): void {
 	}
 	// Previous sibling is a bare tool → merge both into a new group.
 	if (prior && isGroupable(prior.child)) {
-		const group = new ToolGroupComponent();
+		const group = new ToolGroupComponent(parent, component.expanded);
 		group.addTool(prior.child);
 		group.addTool(component);
 		(parent as any).children[prior.index] = group;
@@ -1877,7 +1996,7 @@ function maybeGroup(parent: any, component: any): void {
 	}
 	// Otherwise (sealed group before, or nothing groupable) → wrap the tool in a
 	// fresh open group so it stays visible.
-	const group = new ToolGroupComponent();
+	const group = new ToolGroupComponent(parent, component.expanded);
 	group.addTool(component);
 	(parent as any).children[index] = group;
 	groups.add(group);
@@ -2064,7 +2183,6 @@ function installAssistantExpansion(component: AssistantMessageComponent, content
 		const state = assistantContentStates.get(contentContainer);
 		if (!state) return;
 		for (const group of state.anchors.values()) group.setExpanded(expanded);
-		contentContainer.invalidate();
 	};
 }
 
@@ -2116,6 +2234,18 @@ function restoreAssistantAnchor(parent: any, component: any): void {
 	}
 }
 
+function releaseGroup(group: ToolGroupComponent): void {
+	for (const tool of [...group.children]) group.removeTool(tool);
+	const anchor = groupAnchors.get(group);
+	if (anchor) {
+		const state = assistantContentStates.get(anchor.container);
+		if (state?.anchors.get(anchor.ordinal) === group) state.anchors.delete(anchor.ordinal);
+		groupAnchors.delete(group);
+	}
+	groups.delete(group);
+	if (lastActiveGroup === group) lastActiveGroup = null;
+}
+
 function releaseAssistantAnchors(component: any): void {
 	if (!(component instanceof AssistantMessageComponent)) return;
 	const contentContainer = (component as any).contentContainer;
@@ -2123,9 +2253,7 @@ function releaseAssistantAnchors(component: any): void {
 	const state = assistantContentStates.get(contentContainer);
 	if (!state) return;
 	for (const group of state.anchors.values()) {
-		for (const tool of [...group.children]) delete (tool as any)[PARENT_KEY];
-		groupAnchors.delete(group);
-		groups.delete(group);
+		releaseGroup(group);
 	}
 	state.anchors.clear();
 	state.finalDivider = undefined;
@@ -2199,12 +2327,18 @@ function installGrouping(): void {
 		},
 		removeChild: function (this: any, component: any) {
 			const group = component?.[PARENT_KEY];
-			if (group instanceof ToolGroupComponent && (group as any)[PARENT_KEY] === this) {
+			if (group instanceof ToolGroupComponent && (group.chatContainer === this || group === this || groupAnchors.get(group)?.container === this)) {
 				group.removeTool(component);
-				if (group.children.length === 0) groups.delete(group);
+				if (group.isEmpty()) {
+					removeGroupFromContainer(group.chatContainer, group);
+					const anchor = groupAnchors.get(group);
+					if (anchor) removeGroupFromContainer(anchor.container, group);
+					releaseGroup(group);
+				}
 				return;
 			}
-			releaseAssistantAnchors(component);
+			if (component instanceof ToolGroupComponent && this.children.includes(component)) releaseGroup(component);
+			if (this.children.includes(component)) releaseAssistantAnchors(component);
 			return state.original.removeChild.call(this, component);
 		},
 		clear: function (this: any) {
@@ -2218,8 +2352,7 @@ function installGrouping(): void {
 			}
 			for (const child of [...(this.children ?? [])]) {
 				if (child instanceof ToolGroupComponent) {
-					for (const tool of [...child.children]) delete tool[PARENT_KEY];
-					groups.delete(child);
+					releaseGroup(child);
 				}
 				releaseAssistantAnchors(child);
 			}
@@ -2283,6 +2416,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		currentTheme = ctx.ui.theme;
+		getToolsExpanded = ctx.ui.getToolsExpanded?.bind(ctx.ui);
 		ctx.ui.setHiddenThinkingLabel("");
 		// Capture the TUI instance via setWidget's factory so the animation can
 		// call its throttled requestRender() to repaint just the changed cells.

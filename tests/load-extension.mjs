@@ -8,7 +8,7 @@ import { mock } from "node:test";
 const requireFromPi = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent"));
 const { createJiti } = requireFromPi("jiti");
 
-export async function loadExtension() {
+export async function loadExtension(options = {}) {
 	const configPath = join(homedir(), ".pi", "agent", "compact-ui.json");
 	const readFileSync = fs.readFileSync;
 	let configReads = 0;
@@ -26,7 +26,7 @@ export async function loadExtension() {
 	});
 	syncBuiltinESMExports();
 	try {
-		const extension = await createJiti(import.meta.url).import("../index.ts");
+		const extension = await createJiti(import.meta.url, options).import("../index.ts");
 		assert.equal(configReads, 1, "Extension must read the isolated test configuration");
 		return extension;
 	} finally {
