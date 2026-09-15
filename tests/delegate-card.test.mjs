@@ -165,8 +165,9 @@ test("renderDelegateStandaloneRows renders standalone task card in pending, comp
 	tool.executionStarted = true;
 	const pendingRows = renderDelegateStandaloneRows(tool, 120);
 	const pendingText = pendingRows.map(stripTerminalSequences).join("\n");
-	assert.match(pendingText, /⚡ delegate\[planner\]/);
+	assert.match(pendingText, /⚡ subagent \[planner\]/);
 	assert.match(pendingText, /running/);
+	assert.match(pendingText, /task: "Step 1: Plan/);
 
 	// 2. Completed collapsed
 	tool.updateResult({
@@ -175,19 +176,66 @@ test("renderDelegateStandaloneRows renders standalone task card in pending, comp
 	});
 	const completedRows = renderDelegateStandaloneRows(tool, 120);
 	const completedText = completedRows.map(stripTerminalSequences).join("\n");
-	assert.match(completedText, /✓ ⚡ delegate\[planner\]/);
+	assert.match(completedText, /⚡ subagent \[planner\]/);
 	assert.match(completedText, /"Step 1: Plan/);
 	assert.match(completedText, /exit 0/);
+	assert.match(completedText, /output: \/tmp\/plan\.md/);
 	assert.doesNotMatch(completedText, /Ctrl\+O to collapse/);
 
 	// 3. Expanded
 	tool.setExpanded(true);
 	const expandedRows = renderDelegateStandaloneRows(tool, 120);
 	const expandedText = expandedRows.map(stripTerminalSequences).join("\n");
-	assert.match(expandedText, /Delegate output: \/tmp\/plan\.md/);
+	assert.match(expandedText, /output: \/tmp\/plan\.md/);
 	assert.match(expandedText, /> Step 1: Plan/);
 	assert.match(expandedText, /Ctrl\+O to collapse/);
 	assert.match(expandedRows.join("\n"), /\x1b\]8;;file:\/\/\/tmp\/plan\.md/);
+});
+
+test("renderDelegateStandaloneRows pairs acp_delegate and acp_delegate_wait into a unified subagent tree", (t) => {
+	links(t, true);
+	const delegateTool = new ToolExecutionComponent(
+		"acp_delegate",
+		"call_del_pair",
+		{ agent: "researcher", task: "Analyze performance" },
+		{},
+		undefined,
+		{ requestRender() {} },
+		"/tmp/project",
+	);
+	delegateTool.executionStarted = true;
+	delegateTool.updateResult({
+		content: [{ type: "text", text: "Dispatched delegate del_pair_123" }],
+		details: { runId: "del_pair_123" },
+	});
+
+	const waitTool = new ToolExecutionComponent(
+		"acp_delegate_wait",
+		"call_wait_pair",
+		{ runId: "del_pair_123" },
+		{},
+		undefined,
+		{ requestRender() {} },
+		"/tmp/project",
+	);
+	waitTool.executionStarted = true;
+
+	// Wait tool should return [] as it pairs with delegateTool
+	const waitRows = renderDelegateStandaloneRows(waitTool, 120);
+	assert.deepEqual(waitRows, []);
+
+	// Now wait finishes
+	waitTool.updateResult({
+		content: [{ type: "text", text: "Completed del_pair_123. Full result: /tmp/del_pair_123.out" }],
+		details: { runId: "del_pair_123", exitCode: 0, outputFile: "/tmp/del_pair_123.out" },
+	});
+
+	const mergedRows = renderDelegateStandaloneRows(delegateTool, 120);
+	const mergedText = mergedRows.map(stripTerminalSequences).join("\n");
+	assert.match(mergedText, /⚡ subagent \[researcher\]/);
+	assert.match(mergedText, /exit 0/);
+	assert.match(mergedText, /task: "Analyze performance"/);
+	assert.match(mergedText, /output: \/tmp\/del_pair_123\.out/);
 });
 
 test("renderDelegateStandaloneRows supports the active pi theme", () => {

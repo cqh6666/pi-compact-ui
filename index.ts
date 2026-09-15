@@ -389,7 +389,7 @@ export function fullOutputEntry(name: string, details: unknown, cwd?: string): s
 	return `Full output: ${getCapabilities().hyperlinks ? hyperlink(label, pathToFileURL(path).href) : label}`;
 }
 
-export function delegateOutputEntry(name: string, details: unknown, text?: string, cwd?: string): string | undefined {
+export function delegateOutputPath(name: string, details: unknown, text?: string, cwd?: string): { path: string; label: string; url: string } | undefined {
 	if (!name.startsWith("acp_delegate") && name !== "subagent") return undefined;
 	let pathVal: string | undefined;
 	if (details && typeof details === "object") {
@@ -399,14 +399,21 @@ export function delegateOutputEntry(name: string, details: unknown, text?: strin
 		else if (typeof data.resultFile === "string") pathVal = data.resultFile;
 	}
 	if (!pathVal && text) {
-		const match = text.match(/(?:output(?:\s+is)?(?:\s+at)?|(?:result|output)\s+written\s+to|Output:)\s*[`'"]?(\/[^`'"\s\n]+)[`'"]?/i);
+		const match = text.match(/(?:output(?:\s+is)?(?:\s+at)?|(?:result|output)\s+written\s+to|Output:|Full result:)\s*[`'"]?(\/[^`'"\s\n]+)[`'"]?/i);
 		if (match) pathVal = match[1];
 	}
 	if (!pathVal) return undefined;
 	const path = localPath(pathVal, cwd);
 	if (!path) return undefined;
 	const label = shortenPath(path);
-	return `Delegate output: ${getCapabilities().hyperlinks ? hyperlink(label, pathToFileURL(path).href) : label}`;
+	const url = pathToFileURL(path).href;
+	return { path, label, url };
+}
+
+export function delegateOutputEntry(name: string, details: unknown, text?: string, cwd?: string): string | undefined {
+	const info = delegateOutputPath(name, details, text, cwd);
+	if (!info) return undefined;
+	return `Delegate output: ${getCapabilities().hyperlinks ? hyperlink(info.label, info.url) : info.label}`;
 }
 
 export function renderEditDiff(
@@ -1109,88 +1116,252 @@ function renderCompressRows(tool: any, width: number): string[] {
 
 const DELEGATE_STANDALONE_TOOLS = new Set(["acp_delegate", "acp_delegate_wait", "acp_delegate_cancel", "subagent"]);
 
+const subagentRunsByRunId = new Map<string, any>();
+const subagentWaitsByRunId = new Map<string, any>();
+let latestDispatchedDelegate: any = null;
+
+function extractToolRunId(tool: any): string | undefined {
+	if (tool.args?.runId) return String(tool.args.runId);
+	if (tool.result?.details && typeof tool.result.details === "object") {
+		const d = tool.result.details as Record<string, unknown>;
+		if (typeof d.runId === "string") return d.runId;
+	}
+	const text = toolResultText(tool);
+	if (text) {
+		const m = text.match(/\b(?:runId|delegate)\s+[`'"]?([a-zA-Z0-9_-]+)[`'"]?/i);
+		if (m) return m[1];
+	}
+	return undefined;
+}
+
 export function renderDelegateStandaloneRows(tool: any, width: number): string[] {
+	const toolName = tool.toolName || tool.name || "acp_delegate";
+
+	// Pairing logic between delegate and wait/cancel
+	if (toolName === "acp_delegate" || toolName === "subagent") {
+		latestDispatchedDelegate = tool;
+		const runId = extractToolRunId(tool);
+		if (runId) {
+			subagentRunsByRunId.set(runId, tool);
+			if (subagentWaitsByRunId.has(runId)) {
+				const wait = subagentWaitsByRunId.get(runId);
+				tool._waitTool = wait;
+				wait._pairedDelegate = tool;
+			}
+		}
+	} else if (toolName === "acp_delegate_wait" || toolName === "acp_delegate_cancel") {
+		const waitRunId = extractToolRunId(tool) || tool.args?.runId;
+		if (waitRunId) {
+			subagentWaitsByRunId.set(waitRunId, tool);
+		}
+		let paired = tool._pairedDelegate;
+		if (!paired && waitRunId && subagentRunsByRunId.has(waitRunId)) {
+			paired = subagentRunsByRunId.get(waitRunId);
+		}
+		if (!paired && latestDispatchedDelegate && !latestDispatchedDelegate._waitTool) {
+			const delRunId = extractToolRunId(latestDispatchedDelegate);
+			if (!waitRunId || !delRunId || waitRunId === delRunId) {
+				paired = latestDispatchedDelegate;
+			}
+		}
+		if (paired) {
+			tool._pairedDelegate = paired;
+			if (toolName === "acp_delegate_cancel") {
+				paired._cancelTool = tool;
+			} else {
+				paired._waitTool = tool;
+			}
+			return [];
+		}
+	}
+
+	const waitTool = tool._waitTool;
+	const cancelTool = tool._cancelTool;
+
 	const theme = currentTheme || tool.ui?.theme;
 	const fg = (color: string, text: string) => theme?.fg?.(color, text) ?? text;
 	const bold = theme?.bold ? theme.bold : (t: string) => t;
-	const padding = "  ";
+
+	const padding = " ".repeat(Math.min(GROUP_PADDING_X, Math.max(0, width - 1)));
 	const contentWidth = Math.max(1, width - padding.length);
 
-	const isPending = tool.isPartial === true || (tool.executionStarted && !tool.result);
+	const isWaitPending = Boolean(waitTool && (waitTool.isPartial === true || (waitTool.executionStarted && !waitTool.result)));
+	const isDelegatePending = Boolean(tool.isPartial === true || (tool.executionStarted && !tool.result));
+	const isPending = isDelegatePending || isWaitPending;
+
 	const frame = SPINNER[Math.floor((Date.now() - spinnerStart) / SPINNER_MS) % SPINNER.length]!;
 	if (isPending) {
 		scheduleAnimation();
 	}
 
-	const toolName = tool.toolName || tool.name || "acp_delegate";
+	const effectiveResult = waitTool?.result || tool.result;
+	const effectiveResultText = toolResultText(waitTool) || toolResultText(tool);
+	const isError = Boolean((waitTool?.result?.isError || tool.result?.isError) ?? false);
+
 	let agentName = "";
-	let taskSummary = "…";
 	let fullTask = "";
 
-	if (toolName === "acp_delegate" || toolName === "subagent") {
-		if (tool.args?.agent) agentName = `[${tool.args.agent}]`;
-		if (tool.args?.task) {
-			fullTask = String(tool.args.task).trim();
-			taskSummary = `"${oneLine(fullTask, Math.max(20, contentWidth - 40))}"`;
-		} else if (tool.args?.resumeFrom) {
-			taskSummary = `resume ${tool.args.resumeFrom}`;
-		}
-	} else if (toolName === "acp_delegate_wait") {
-		taskSummary = tool.args?.runId ? `wait ${tool.args.runId}` : "wait";
-	} else if (toolName === "acp_delegate_cancel") {
-		taskSummary = tool.args?.runId ? `cancel ${tool.args.runId}` : "cancel";
+	if (tool.args?.agent) {
+		agentName = `[${tool.args.agent}]`;
+	}
+	if (tool.args?.task) {
+		fullTask = String(tool.args.task).trim();
+	} else if (tool.args?.resumeFrom) {
+		fullTask = `resume ${tool.args.resumeFrom}`;
+	} else if (toolName === "acp_delegate_wait" && tool.args?.runId) {
+		fullTask = `wait ${tool.args.runId}`;
 	}
 
-	const title = toolName === "subagent" ? `⚡ subagent${agentName}` : toolName.startsWith("acp_delegate_") ? `⚡ ${toolName.slice(4)}` : `⚡ delegate${agentName}`;
-	const elapsed = `${toolElapsed(tool)}s`;
-	const stats = resultSummary(toolName, tool.result, tool.isPartial);
+	let exitCode: number | undefined;
+	if (waitTool?.result?.details && typeof waitTool.result.details === "object") {
+		const d = waitTool.result.details as Record<string, unknown>;
+		if (typeof d.exitCode === "number") exitCode = d.exitCode;
+	}
+	if (exitCode === undefined && tool.result?.details && typeof tool.result.details === "object") {
+		const d = tool.result.details as Record<string, unknown>;
+		if (typeof d.exitCode === "number") exitCode = d.exitCode;
+	}
+	if (exitCode === undefined && effectiveResultText) {
+		const m = effectiveResultText.match(/\bexit\s+(-?\d+)\b/i);
+		if (m) exitCode = parseInt(m[1], 10);
+	}
 
-	let singleLine = "";
-	if (isPending) {
-		singleLine = `${fg("accent", frame)} ${fg("accent", bold(title))}  ${fg("text", taskSummary)}  ${fg("muted", `(running · ${elapsed})`)}`;
-	} else if (tool.result?.isError) {
-		const statusText = stats || "failed";
-		singleLine = `${fg("error", "✗")} ${fg("error", bold(title))}  ${fg("text", taskSummary)}  ${fg("dim", "·")} ${fg("error", statusText)}  ${fg("muted", `(${elapsed})`)}`;
+	let statusText = "";
+	if (cancelTool) {
+		statusText = "cancelled";
+	} else if (isPending) {
+		statusText = "running";
+	} else if (exitCode !== undefined) {
+		statusText = `exit ${exitCode}`;
+	} else if (isError) {
+		statusText = "failed";
 	} else {
-		const statsDisplay = stats ? `${fg("dim", "·")} ${fg("toolTitle", stats)}  ` : "";
-		singleLine = `${fg("success", "✓")} ${fg("accent", bold(title))}  ${fg("text", taskSummary)}  ${statsDisplay}${fg("muted", `(${elapsed})`)}`;
+		const s = resultSummary(toolName, effectiveResult, tool.isPartial);
+		statusText = s || "completed";
 	}
 
-	const lines: string[] = [padding + truncateToWidth(singleLine, contentWidth, "…")];
+	const start = toolStarts.get(tool.toolCallId) ?? (waitTool ? toolStarts.get(waitTool.toolCallId) : undefined);
+	let end: number | undefined;
+	if (isPending) {
+		end = Date.now();
+	} else if (waitTool) {
+		end = toolEnds.get(waitTool.toolCallId) ?? Date.now();
+	} else {
+		end = toolEnds.get(tool.toolCallId) ?? Date.now();
+	}
+	let elapsed = "0.0s";
+	if (start !== undefined && end !== undefined) {
+		elapsed = `${Math.max(0, (end - start) / 1000).toFixed(1)}s`;
+	} else {
+		elapsed = `${toolElapsed(waitTool || tool)}s`;
+	}
 
-	if (tool.expanded) {
-		if (tool.result?.isError) {
-			const reason = extractFailureReason(tool.result);
-			if (reason) lines.push(padding + "  " + fg("error", truncateToWidth(reason, contentWidth - 2, "…")));
+	const title = agentName
+		? `subagent ${agentName}`
+		: (toolName === "acp_delegate_wait" && tool.args?.runId ? `subagent · wait ${tool.args.runId}` : "subagent");
+
+	let headerLine = "";
+	if (isPending) {
+		headerLine = `${fg("accent", frame)} ${fg("accent", "⚡")} ${fg("accent", bold(title))} ${fg("dim", "·")} ${fg("muted", `(running · ${elapsed})`)}`;
+	} else if (isError || (exitCode !== undefined && exitCode !== 0)) {
+		headerLine = `${fg("error", "✗")} ${fg("error", "⚡")} ${fg("error", bold(title))} ${fg("dim", "·")} ${fg("error", statusText)} ${fg("muted", `(${elapsed})`)}`;
+	} else {
+		headerLine = `${fg("accent", "⚡")} ${fg("accent", bold(title))} ${fg("dim", "·")} ${fg("toolTitle", statusText)} ${fg("muted", `(${elapsed})`)}`;
+	}
+
+	const lines: string[] = [headerLine];
+
+	const isExpanded = Boolean(tool.expanded || waitTool?.expanded);
+
+	type BranchItem = {
+		text: string;
+		type?: "task" | "output" | "error" | "custom";
+	};
+	const branchItems: BranchItem[] = [];
+
+	if (fullTask) {
+		const taskSummary = oneLine(fullTask, Math.max(20, contentWidth - 14));
+		branchItems.push({
+			text: `${fg("dim", "task: ")}${fg("text", `"${taskSummary}"`)}`,
+			type: "task",
+		});
+	}
+
+	if (isError) {
+		const reason = extractFailureReason(effectiveResult);
+		if (reason) {
+			branchItems.push({
+				text: `${fg("error", "error: ")}${fg("error", truncateToWidth(reason, contentWidth - 14, "…"))}`,
+				type: "error",
+			});
 		}
+	}
 
-		if (fullTask && fullTask.includes("\n")) {
-			const taskLines = fullTask.split("\n");
-			for (const tLine of taskLines.slice(0, 4)) {
-				lines.push(padding + "  " + fg("dim", truncateToWidth(`> ${tLine}`, contentWidth - 4, "…")));
+	const outputInfo = delegateOutputPath(
+		toolName,
+		effectiveResult?.details,
+		effectiveResultText,
+		tool.cwd || waitTool?.cwd,
+	);
+	if (outputInfo) {
+		const link = getCapabilities().hyperlinks ? hyperlink(outputInfo.label, outputInfo.url) : outputInfo.label;
+		branchItems.push({
+			text: `${fg("dim", "output: ")}${fg("accent", link)}`,
+			type: "output",
+		});
+	}
+
+	if (!isExpanded) {
+		for (let i = 0; i < branchItems.length; i++) {
+			const isLast = i === branchItems.length - 1;
+			const rail = isLast ? "└── " : "├── ";
+			lines.push(fg("dim", rail) + branchItems[i].text);
+		}
+	} else {
+		if (fullTask) {
+			const taskSummary = oneLine(fullTask, Math.max(20, contentWidth - 14));
+			lines.push(fg("dim", "├── ") + fg("dim", "task: ") + fg("text", `"${taskSummary}"`));
+			if (fullTask.includes("\n")) {
+				const taskLines = fullTask.split("\n");
+				for (const tLine of taskLines.slice(0, 4)) {
+					lines.push(fg("dim", "│   ") + fg("dim", `> ${tLine}`));
+				}
+				if (taskLines.length > 4) {
+					lines.push(fg("dim", "│   ") + fg("muted", `… +${taskLines.length - 4} more lines`));
+				}
 			}
-			if (taskLines.length > 4) {
-				lines.push(padding + "  " + fg("muted", `… +${taskLines.length - 4} more lines`));
+		}
+
+		if (isError) {
+			const reason = extractFailureReason(effectiveResult);
+			if (reason) {
+				lines.push(fg("dim", "├── ") + fg("error", `error: ${reason}`));
 			}
 		}
 
-		const outputEntry = delegateOutputEntry(toolName, tool.result?.details, toolResultText(tool), tool.cwd);
-		if (outputEntry) {
-			lines.push(padding + "  " + fg("accent", outputEntry));
+		if (outputInfo) {
+			const link = getCapabilities().hyperlinks ? hyperlink(outputInfo.label, outputInfo.url) : outputInfo.label;
+			lines.push(fg("dim", "├── ") + fg("dim", "output: ") + fg("accent", link));
 		}
 
-		const resultText = toolResultText(tool);
-		if (resultText && !tool.result?.isError) {
-			const previewLines = resultText.split("\n").filter((l: string) => !l.startsWith("Full result:") && !l.startsWith("Delegate **"));
+		if (effectiveResultText && !isError) {
+			const previewLines = effectiveResultText
+				.split("\n")
+				.map((l: string) => l.trim())
+				.filter((l: string) => l && !l.startsWith("Full result:") && !l.startsWith("Delegate **") && !l.startsWith("Task:"));
 			for (const line of previewLines.slice(0, config.expandedToolLines)) {
-				lines.push(padding + "  " + fg("dim", truncateToWidth(line, contentWidth - 2, "…")));
+				lines.push(fg("dim", "│   ") + fg("dim", line));
+			}
+			if (previewLines.length > config.expandedToolLines) {
+				lines.push(fg("dim", "│   ") + fg("muted", `… +${previewLines.length - config.expandedToolLines} more lines`));
 			}
 		}
 
-		lines.push(padding + "  " + fg("muted", "(Ctrl+O to collapse)"));
+		lines.push(fg("dim", "└── ") + fg("muted", "(Ctrl+O to collapse)"));
 	}
 
-	return lines;
+	const rendered = lines.map((line) => padding + truncateToWidth(line, contentWidth, "…"));
+	return ["", ...rendered];
 }
 
 const WRAPPED_RENDER_KEY = Symbol.for("pi-compact-ui.tool-execution-wrapped-render");
