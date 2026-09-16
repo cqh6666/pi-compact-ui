@@ -22,6 +22,7 @@ import type { ExtensionAPI, Theme, ThemeColor } from "@earendil-works/pi-coding-
 import {
 	AssistantMessageComponent,
 	CompactionSummaryMessageComponent,
+	SkillInvocationMessageComponent,
 	ToolExecutionComponent,
 	createBashTool,
 	createEditTool,
@@ -275,12 +276,27 @@ function updateThinkingTokenCount(message: any): void {
 	thinkingTokenCountExact = false;
 }
 
+export function extractSkillName(path: unknown): string | undefined {
+	if (typeof path !== "string") return undefined;
+	const normalized = path.replace(/\\/g, "/");
+	const dirMatch = normalized.match(/(?:^|\/)skills\/([^/]+)\/SKILL\.md$/i);
+	if (dirMatch?.[1]) return dirMatch[1];
+	const fileMatch = normalized.match(/(?:^|\/)skills\/([^/]+)\.md$/i);
+	if (fileMatch?.[1] && fileMatch[1].toUpperCase() !== "SKILL") return fileMatch[1];
+	return undefined;
+}
+
 function toolSummary(name: string, args: any): { name: string; content: string } {
 	switch (name) {
 		case "bash":
 			return { name: "bash", content: oneLine(args?.command || "…") };
-		case "read":
+		case "read": {
+			const skillName = extractSkillName(args?.path);
+			if (skillName) {
+				return { name: "✨ skill", content: `[${skillName}]` };
+			}
 			return { name: "read", content: shortenPath(args?.path || "…") };
+		}
 		case "write":
 		case "edit":
 			return { name, content: shortenPath(args?.path || "…") };
@@ -450,9 +466,18 @@ export function aggregateConsecutiveTools<T>(
 	for (let start = 0; start < tools.length;) {
 		const tool = tools[start]!;
 		const name = getToolName(tool);
+		const args = getArgs(tool);
+		const isSkill = name === "read" && typeof (args as any)?.path === "string" && Boolean(extractSkillName((args as any).path));
 		let end = start + 1;
-		if (getStatus(tool) === "success" && !config.standaloneTools?.includes(name)) {
-			while (end < tools.length && getToolName(tools[end]!) === name && getStatus(tools[end]!) === "success") end++;
+		if (getStatus(tool) === "success" && !isSkill && !config.standaloneTools?.includes(name)) {
+			while (
+				end < tools.length &&
+				getToolName(tools[end]!) === name &&
+				getStatus(tools[end]!) === "success" &&
+				!(name === "read" && typeof (getArgs(tools[end]!) as any)?.path === "string" && Boolean(extractSkillName((getArgs(tools[end]!) as any).path)))
+			) {
+				end++;
+			}
 		}
 		if (end === start + 1) {
 			items.push({ type: "tool", tool });
@@ -1423,6 +1448,7 @@ const TOOL_EXECUTION_HANDLERS_KEY = Symbol.for("pi-compact-ui.tool-execution-han
 const TOOL_HEADER_KEY = Symbol.for("pi-compact-ui.tool-header");
 const TOOL_RENDER_PATCH_KEY = Symbol.for("pi-compact-ui.tool-render-patch");
 const TOOL_MOUSE_PATCH_KEY = Symbol.for("pi-compact-ui.tool-mouse-patch");
+const SKILL_MOUSE_PATCH_KEY = Symbol.for("pi-compact-ui.skill-mouse-patch");
 
 type ClickableTool = {
 	toolName: string;
@@ -1432,6 +1458,24 @@ type ClickableTool = {
 	[TOOL_HEADER_KEY]?: HeaderBounds;
 };
 type ToolMouseHandler = (this: ClickableTool, event: TuiMouseEvent) => TuiMouseEventResult | undefined;
+
+function installSkillInvocationCustomRendering(): void {
+	const prototype = SkillInvocationMessageComponent?.prototype as any;
+	if (!prototype) return;
+
+	const previous = prototype[SKILL_MOUSE_PATCH_KEY] as { original: any; installed: any } | undefined;
+	const original = previous && prototype.handleMouse === previous.installed ? previous.original : prototype.handleMouse;
+	const installed = function (this: any, event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (event.type !== "click" || event.button !== "left") return original?.call(this, event);
+		// In collapsed mode, line 0 is the single clickable line [skill] name (Ctrl+O to expand).
+		// In expanded mode, line 0 is [skill] and line 1 is **name**. Allow clicking either header line.
+		if (this.expanded ? event.y > 1 : event.y !== 0) return original?.call(this, event);
+		this.setExpanded(!this.expanded);
+		return { handled: true, render: true };
+	};
+	prototype.handleMouse = installed;
+	prototype[SKILL_MOUSE_PATCH_KEY] = { original, installed };
+}
 
 function installToolExecutionCustomRendering(): void {
 	const prototype = ToolExecutionComponent.prototype as any;
@@ -2396,6 +2440,7 @@ export default function (pi: ExtensionAPI) {
 	installNativeThinkingSuppression();
 	installCompactionSummaryRendering();
 	installToolExecutionCustomRendering();
+	installSkillInvocationCustomRendering();
 
 	const delegate = (name: keyof ReturnType<typeof getTools>) =>
 		async (toolCallId: string, params: unknown, signal: AbortSignal, onUpdate?: unknown, ctx?: unknown) => {
@@ -2428,6 +2473,7 @@ export default function (pi: ExtensionAPI) {
 		installNativeThinkingSuppression();
 		installCompactionSummaryRendering();
 		installToolExecutionCustomRendering();
+		installSkillInvocationCustomRendering();
 	});
 
 	pi.on("tool_execution_start", async (event) => {
