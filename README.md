@@ -101,6 +101,7 @@ Use `/compact-ui-config` for numeric display settings. Configuration is stored a
 | `expandedToolLines` | `5` | Result-preview lines per expanded tool |
 | `expandedThinkingLines` | `10` | Thinking-preview lines when expanded |
 | `standaloneTools` | `["compress"]` | Tools excluded from ordinary grouping |
+| `headerStyle` | `"compact"` | Header style: `"compact"` (`tools done · N tools`) or `"natural"` (Codex-style: `Loaded a tool, read files, ran commands`) |
 
 Default configuration:
 
@@ -109,7 +110,8 @@ Default configuration:
   "collapsedMaxLines": 3,
   "expandedToolLines": 5,
   "expandedThinkingLines": 10,
-  "standaloneTools": ["compress"]
+  "standaloneTools": ["compress"],
+  "headerStyle": "compact"
 }
 ```
 

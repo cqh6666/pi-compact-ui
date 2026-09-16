@@ -64,6 +64,7 @@ interface CompactUiConfig {
 	expandedToolLines: number;
 	expandedThinkingLines: number;
 	standaloneTools?: string[];
+	headerStyle?: "natural" | "compact";
 }
 
 const DEFAULT_CONFIG: CompactUiConfig = {
@@ -71,6 +72,7 @@ const DEFAULT_CONFIG: CompactUiConfig = {
 	expandedToolLines: 5,
 	expandedThinkingLines: 10,
 	standaloneTools: ["compress", "acp_delegate", "acp_delegate_wait", "subagent"],
+	headerStyle: "compact",
 };
 let config: CompactUiConfig = { ...DEFAULT_CONFIG };
 try {
@@ -590,15 +592,115 @@ function resultSummary(name: string, result?: ToolResultSummary, partial = false
 	return "";
 }
 
-type GroupTool = { status: ToolStatus; startedAt?: number; endedAt?: number };
+type GroupTool = { name?: string; args?: unknown; status: ToolStatus; startedAt?: number; endedAt?: number };
+
+export function isImagePath(path: unknown): boolean {
+	if (typeof path !== "string") return false;
+	return /\.(png|jpe?g|gif|webp|bmp|ico|tiff?|svg)$/i.test(path);
+}
+
+export function formatActionsSummary(tools: { name?: string; args?: unknown }[]): string {
+	if (!tools.length) return "tools done";
+	const counts = {
+		skills: new Set<string>(),
+		images: 0,
+		loadTool: 0,
+		read: 0,
+		edit: 0,
+		bash: 0,
+		search: 0,
+		other: 0,
+	};
+
+	for (const tool of tools) {
+		const name = tool.name;
+		if (!name) {
+			counts.other++;
+			continue;
+		}
+		if (name === "read") {
+			const path = (tool.args as any)?.path;
+			const skill = extractSkillName(path);
+			if (skill) {
+				counts.skills.add(skill);
+			} else if (isImagePath(path)) {
+				counts.images++;
+			} else {
+				counts.read++;
+			}
+		} else if (name === "send_image_to_wechat") {
+			counts.images++;
+		} else if (name === "edit" || name === "write") {
+			counts.edit++;
+		} else if (name === "bash") {
+			counts.bash++;
+		} else if (name === "web_search" || name === "source_check" || name === "fetch_content") {
+			counts.search++;
+		} else if (name.includes("load") || name === "tool_search" || name === "ToolSearch") {
+			counts.loadTool++;
+		} else {
+			counts.other++;
+		}
+	}
+
+	const phrases: string[] = [];
+
+	if (counts.loadTool > 0) {
+		phrases.push(counts.loadTool === 1 ? "Loaded a tool" : "Loaded tools");
+	}
+	if (counts.skills.size > 0) {
+		const skillNames = Array.from(counts.skills);
+		if (skillNames.length === 1) {
+			phrases.push(`Read ${skillNames[0]} skill`);
+		} else {
+			phrases.push(`Read ${skillNames.length} skills`);
+		}
+	}
+	if (counts.images > 0) {
+		phrases.push(counts.images === 1 ? "viewed an image" : `viewed ${counts.images} images`);
+	}
+	if (counts.read > 0) {
+		phrases.push(counts.read === 1 ? "read a file" : "read files");
+	}
+	if (counts.edit > 0) {
+		phrases.push(counts.edit === 1 ? "edited a file" : "edited files");
+	}
+	if (counts.bash > 0) {
+		phrases.push(counts.bash === 1 ? "ran a command" : "ran commands");
+	}
+	if (counts.search > 0) {
+		phrases.push("searched the web");
+	}
+	if (counts.other > 0 && phrases.length === 0) {
+		phrases.push(counts.other === 1 ? "ran a tool" : "ran tools");
+	}
+
+	if (!phrases.length) return "tools done";
+	// Capitalize first phrase, keep others lowercase as they are
+	phrases[0] = phrases[0]!.charAt(0).toUpperCase() + phrases[0]!.slice(1);
+	return phrases.join(", ");
+}
 
 function groupHeader(tools: GroupTool[], thinking: boolean, frame: string, fg: (color: string, text: string) => string): string {
 	const pending = tools.some((tool) => tool.status === "pending");
 	const failed = tools.filter((tool) => tool.status === "error").length;
 	const working = pending || thinking;
 	const color = failed ? "error" : pending ? "accent" : thinking ? "thinkingText" : "success";
-	const label = pending ? "tool calling..." : thinking ? "thinking..." : "tools done";
-	let detail = tools.length ? ` · ${tools.length} ${tools.length === 1 ? "tool" : "tools"}` : "";
+	
+	if (config.headerStyle === "compact") {
+		const label = pending ? "tool calling..." : thinking ? "thinking..." : "tools done";
+		let detail = tools.length ? ` · ${tools.length} ${tools.length === 1 ? "tool" : "tools"}` : "";
+		if (failed) detail += ` · ${failed} failed`;
+		if (tools.length && !working) {
+			const known = tools.every((tool) => tool.startedAt !== undefined && tool.endedAt !== undefined && tool.endedAt >= tool.startedAt);
+			const elapsed = known ? ((Math.max(...tools.map((tool) => tool.endedAt!)) - Math.min(...tools.map((tool) => tool.startedAt!))) / 1000).toFixed(1) : "—";
+			detail += ` · ${elapsed}s`;
+		}
+		return fg(color, `${working ? frame : failed ? "✗" : "✓"} ${label}${detail}`);
+	}
+
+	const label = pending ? "tool calling..." : thinking ? "thinking..." : formatActionsSummary(tools);
+	let detail = "";
 	if (failed) detail += ` · ${failed} failed`;
 	if (tools.length && !working) {
 		const known = tools.every((tool) => tool.startedAt !== undefined && tool.endedAt !== undefined && tool.endedAt >= tool.startedAt);
@@ -1755,8 +1857,14 @@ class ToolGroupComponent extends Container {
 
 	private header(frame: string, fg: (color: string, text: string) => string): string {
 		const tools = this.children.map((child) => {
-			const tool = child as Component & { toolCallId?: string };
-			return { status: toolStatus(tool), startedAt: toolStarts.get(tool.toolCallId ?? ""), endedAt: toolEnds.get(tool.toolCallId ?? "") };
+			const tool = child as Component & { toolCallId?: string; toolName?: string; args?: unknown };
+			return {
+				name: tool.toolName,
+				args: tool.args,
+				status: toolStatus(tool),
+				startedAt: toolStarts.get(tool.toolCallId ?? ""),
+				endedAt: toolEnds.get(tool.toolCallId ?? "")
+			};
 		});
 		return groupHeader(tools, this.liveThinkingActive() || (!this.sealed && tools.length === 0), frame, fg);
 	}
